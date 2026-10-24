@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+openai>=1.40
+python-dotenv>=1.0
+pystray>=0.19; sys_platform == "win32"
+Pillow>=10; sys_platform == "win32"

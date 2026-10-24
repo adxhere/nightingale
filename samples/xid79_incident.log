@@ -1,0 +1,15 @@
+Oct 05 13:41:02 gpu-node-17 kubelet[2211]: I1005 13:41:02 pod llama-ft-worker-3 status Running
+Oct 05 13:41:05 gpu-node-17 python[48817]: [rank 27] step 9120 loss 1.384 throughput 3812 tok/s/gpu
+Oct 05 13:41:31 gpu-node-17 dcgm-exporter[1840]: GPU 3 temp 71C power 688W sm_clock 1980MHz
+Oct 05 13:42:10 gpu-node-17 python[48817]: [rank 27] step 9140 loss 1.381 throughput 3809 tok/s/gpu
+Oct 05 13:42:44 gpu-node-17 kernel: pcieport 0000:5c:00.0: AER: Uncorrected (Fatal) error received: 0000:5d:00.0
+Oct 05 13:42:44 gpu-node-17 kernel: nvidia 0000:5d:00.0: AER: PCIe Bus Error: severity=Uncorrected (Fatal), type=Transaction Layer
+Oct 05 13:42:45 gpu-node-17 kernel: NVRM: Xid (PCI:0000:5d:00): 79, pid='<unknown>', name=<unknown>, GPU has fallen off the bus.
+Oct 05 13:42:45 gpu-node-17 kernel: NVRM: GPU 0000:5d:00.0: GPU has fallen off the bus.
+Oct 05 13:42:46 gpu-node-17 dcgm-exporter[1840]: GPU 3 health check failed: DCGM_ST_GPU_IS_LOST
+Oct 05 13:42:47 gpu-node-17 python[48817]: [rank 27] RuntimeError: NCCL error: unhandled system error, remote process exited or there was a network error
+Oct 05 13:42:47 gpu-node-17 python[48817]: [rank 24] NCCL WARN Cuda failure 'unspecified launch failure'
+Oct 05 13:42:49 gpu-node-17 torchrun[48790]: worker group failed (rank 27 exited with code 1); last checkpoint step 9000
+Oct 05 13:43:02 gpu-node-17 nvidia-smi[49110]: Unable to determine the device handle for GPU0000:5d:00.0: Unknown Error
+Oct 05 13:43:30 gpu-node-17 kubelet[2211]: E1005 13:43:30 pod llama-ft-worker-3 status Error, restarting (backoff 10s)
+Oct 05 13:43:41 gpu-node-17 python[49302]: [rank 27] RuntimeError: CUDA error: no CUDA-capable device is detected

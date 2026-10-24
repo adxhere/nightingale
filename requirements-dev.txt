@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+httpx>=0.27
+numpy>=1.24  # the self-test stand-in for PyTorch (tests/fake_torch)

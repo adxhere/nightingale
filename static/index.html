@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <title>Nightingale</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 44 44'%3E%3Crect x='9' y='9' width='26' height='26' rx='6' fill='%2312171b' stroke='%232a3239'/%3E%3Cg fill='%23ffb547'%3E%3Crect x='19' y='11.5' width='6' height='6' rx='1.3'/%3E%3Crect x='11.5' y='19' width='6' height='6' rx='1.3'/%3E%3Crect x='19' y='19' width='6' height='6' rx='1.3'/%3E%3Crect x='26.5' y='19' width='6' height='6' rx='1.3'/%3E%3Crect x='19' y='26.5' width='6' height='6' rx='1.3'/%3E%3C/g%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Semi+Condensed:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#/overview" aria-label="Nightingale overview">
+        <svg class="brand-mark" viewBox="0 0 44 44" aria-hidden="true">
+          <g class="pins"><path d="M16 3v6M22 3v6M28 3v6M16 35v6M22 35v6M28 35v6M3 16h6M3 22h6M3 28h6M35 16h6M35 22h6M35 28h6"/></g>
+          <rect class="die" x="9" y="9" width="26" height="26" rx="6"/>
+          <rect class="cell" x="11.5" y="11.5" width="6" height="6" rx="1.3"/>
+          <rect class="lit" x="19" y="11.5" width="6" height="6" rx="1.3"/>
+          <rect class="pink" x="26.5" y="11.5" width="6" height="6" rx="1.3"/>
+          <rect class="lit" x="11.5" y="19" width="6" height="6" rx="1.3"/>
+          <rect class="lit" x="19" y="19" width="6" height="6" rx="1.3"/>
+          <rect class="lit" x="26.5" y="19" width="6" height="6" rx="1.3"/>
+          <rect class="cell" x="11.5" y="26.5" width="6" height="6" rx="1.3"/>
+          <rect class="lit" x="19" y="26.5" width="6" height="6" rx="1.3"/>
+          <rect class="cell" x="26.5" y="26.5" width="6" height="6" rx="1.3"/>
+        </svg>
+        <span class="wordmark"><b>Nightingale</b><span>Self-healing operations for GPU data centers</span></span>
+      </a>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-foot" id="sidebar-foot"></div>
+    </aside>
+
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menu-btn" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
+      </button>
+      <a class="topbar-brand" href="#/overview">Nightingale</a>
+      <form class="search" id="search" role="search">
+        <label for="search-input" class="sr-only">Find a server, rack or job</label>
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5"/><path d="m13.2 13.2 3.8 3.8"/></svg>
+        <input id="search-input" type="search" autocomplete="off" placeholder="Find a server, rack or job" list="search-list">
+        <datalist id="search-list"></datalist>
+      </form>
+      <div class="topbar-right" id="topbar-right"></div>
+    </header>
+
+    <main id="main" class="content" tabindex="-1"></main>
+  </div>
+  <div class="scrim" id="scrim" hidden></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
