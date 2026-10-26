@@ -69,10 +69,13 @@ const REASON_TEXT = {
   HW_SLOWDOWN: "Hardware slowdown", APPLICATIONS_CLOCKS_SETTING: "App clock setting", SYNC_BOOST: "Sync boost",
   DISPLAY_CLOCK_SETTING: "Display clock setting",
 };
-const hallName = (h) => (h === "L" ? "This computer" : `Hall ${h}`);
+const hallName = (h) => (h === "L" ? "This computer" : h === "R" ? "Real servers" : `Hall ${h}`);
+const realRack = (t) => (S.state && S.state.real && S.state.real.rack_of ? S.state.real.rack_of[t] : null);
+const isReal = (t) => !!realRack(t);
 function shortGpu(name) { return String(name || "NVIDIA GPU").replace(/^NVIDIA\s+/, "").replace(/^GeForce\s+/, ""); }
 function rackOfServer(name) {
   if (isLocal(name)) return "L-01";
+  if (isReal(name)) return realRack(name);
   const n = parseInt(String(name).replace(/\D/g, ""), 10);
   if (!n) return null;
   const idx = Math.floor((n - 1) / 8);
@@ -81,10 +84,10 @@ function rackOfServer(name) {
 function targetLink(t) {
   if (!t) return "";
   if (isLocal(t)) return "#/pc";
-  if (/^dgx-/.test(t)) return `#/fleet?rack=${rackOfServer(t)}&server=${t}`;
+  if (/^dgx-/.test(t) || isReal(t)) return `#/fleet?rack=${rackOfServer(t)}&server=${encodeURIComponent(t)}`;
   return `#/fleet?rack=${t}`;
 }
-function targetName(t) { return isLocal(t) ? "this laptop" : /^dgx-/.test(t) ? t : `rack ${t}`; }
+function targetName(t) { return isLocal(t) ? "this laptop" : /^dgx-/.test(t) || isReal(t) ? t : `rack ${t}`; }
 
 function mix(a, b, t) { return a.map((v, i) => Math.round(v + (b[i] - v) * t)); }
 const HEAT = [[30, [22, 34, 42]], [60, [30, 58, 70]], [71, [46, 88, 102]], [77, [122, 114, 72]], [82, [214, 140, 52]], [88, [240, 90, 60]], [95, [255, 59, 79]]];
@@ -215,13 +218,15 @@ function renderShell() {
     ${modeSwitch(true)}
     <span class="chip model">Triage: ${esc(shortModel(st.models.triage))}</span>
     <span class="chip model">Investigation: ${esc(shortModel(st.models.diagnosis))}</span>
-    <a class="chip dashed" href="#/sources" title="Data sources">Simulated data center, <b>${fmt(st.size)} GPUs</b>${st.local ? " + this laptop" : ""}</a>`);
-  if (S.searchSize !== st.size + (st.local ? 0.5 : 0)) {
-    S.searchSize = st.size + (st.local ? 0.5 : 0);
+    <a class="chip dashed" href="#/sources" title="Data sources">Simulated data center, <b>${fmt(st.size)} GPUs</b>${st.local ? " + this laptop" : ""}${st.real ? ` + <b>${plural(st.real.servers, "real server")}</b>` : ""}</a>`);
+  const searchKey = `${st.size}|${st.local ? 1 : 0}|${st.real ? Object.keys(st.real.rack_of || {}).join(",") : ""}`;
+  if (S.searchSize !== searchKey) {
+    S.searchSize = searchKey;
     const opts = [];
     st.fleet.forEach((h) => h.racks.forEach((r) => opts.push(`rack ${r.id}`)));
     for (let i = 1; i <= st.servers; i++) opts.push(`dgx-${String(i).padStart(4, "0")}`);
     st.jobs.forEach((j) => opts.push(j.id));
+    if (st.real) Object.keys(st.real.rack_of || {}).forEach((n) => opts.push(n));
     opts.push(LOCAL);
     $("#search-list").innerHTML = opts.map((o) => `<option value="${o}">`).join("");
   }
@@ -387,6 +392,7 @@ function miniMap(st) {
 function rackButton(r, selected, mini) {
   const cells = r.temps.map((t, i) => `<span style="--c:${cellColor(r.codes[i], t)}"></span>`).join("");
   if (r.local) return localRackButton(r, selected, mini, cells);
+  if (r.real) return realRackButton(r, selected, mini, cells);
   const cls = r.lost && !r.watch ? "down" : r.watch || r.cooling ? "alert" : "";
   const issues = [r.lost ? `${r.lost} down` : "", r.watch ? `${r.watch} under watch` : "", r.cooling ? "cooling problem" : ""].filter(Boolean).join(", ") || "all healthy";
   const label = `Rack ${r.id}, average ${r.avg} degrees, ${issues}`;
@@ -408,6 +414,17 @@ function localRackButton(r, selected, mini, cells) {
   const tag = mini ? "a" : "button";
   return `<${tag} class="rack local ${cls}" ${attrs} aria-label="${esc(label)}" title="${esc(label)}">${head}<span class="cells n${r.temps.length}">${cells}</span>${foot}</${tag}>`;
 }
+function realRackButton(r, selected, mini, cells) {
+  const issues = [r.lost ? `${r.lost} not reporting` : "", r.watch ? `${r.watch} under watch` : ""].filter(Boolean).join(", ") || "all healthy";
+  const label = `Real servers, rack ${r.id} (${r.label}), ${plural(r.servers, "server")}, ${issues}`;
+  const dot = r.lost ? "bad" : r.watch ? "watch" : "";
+  const cls = r.lost && !r.watch ? "down" : r.watch ? "alert" : "";
+  const head = mini ? `<span class="rack-head"><b>${r.id}</b></span>` : `<span class="rack-head"><b>${r.id}</b><span class="tag-real">Real</span><span class="rdot ${dot}"></span></span>`;
+  const foot = mini ? "" : `<span class="rack-foot">${esc(r.label)}, ${plural(r.servers, "server")}</span>`;
+  const attrs = mini ? `href="#/fleet?rack=${r.id}"` : `type="button" data-action="rack" data-id="${r.id}" aria-pressed="${selected}"`;
+  const tag = mini ? "a" : "button";
+  return `<${tag} class="rack real ${cls}" ${attrs} aria-label="${esc(label)}" title="${esc(label)}">${head}<span class="cells n${Math.min(r.temps.length, 16)}">${cells}</span>${foot}</${tag}>`;
+}
 function legendHtml(compact) {
   return `<span>${compact ? "" : "GPU temperature"}<span class="ramp" aria-hidden="true"></span>30°C to 95°C</span>
     <span><i class="sw" style="background:${rgb(WATCH)}"></i>Under watch</span>
@@ -416,6 +433,14 @@ function legendHtml(compact) {
 
 function jobsTable(st) {
   const rows = st.jobs.map((j) => {
+    if (j.real) {
+      const rp = j.status === "running" ? '<span class="pill">Running</span>' : j.status === "restarting" ? '<span class="pill"><span class="spinner"></span>Restarting</span>'
+        : j.status === "pending" ? '<span class="pill attn">Pending</span>' : '<span class="pill bad">Crashing</span>';
+      return `<tr><td><b>${esc(j.id)}</b><span class="sub">namespace ${esc(j.owner)} <span class="tag-real">Real</span></span></td>
+        <td class="r">${fmt(j.gpus)}<span class="sub">${plural(j.servers, "server")}</span></td>
+        <td>${rp}${j.last_error ? `<span class="sub">${esc(j.last_error)}</span>` : ""}</td>
+        <td class="hide-sm"><span class="sub">Kubernetes workload</span></td><td class="r hide-sm"><span class="sub">not reported</span></td><td class="r hide-sm"><span class="sub">its own checkpoints</span></td></tr>`;
+    }
     const pill = j.status === "running" ? (j.rate < 0.9 ? '<span class="pill attn">Slowed</span>' : '<span class="pill">Running</span>')
       : j.status === "restarting" ? '<span class="pill"><span class="spinner"></span>Restarting</span>'
       : `<span class="pill bad">${j.status === "failed" ? "Failed" : "Crashed"}</span>`;
@@ -462,8 +487,8 @@ VIEWS.fleet = {
   update(st) {
     const g = st.gauges;
     setRegion("fl-banner", $("#r-banner"), banner());
-    const simHalls = st.halls.filter((h) => h !== "L").length;
-    setRegion("fl-lede", $("#r-flede"), `${fmt(st.size)} GPUs in ${fmt(st.servers)} servers and ${st.racks} racks${simHalls > 1 ? ` across ${simHalls} halls` : ""}${st.local ? ", plus this laptop's GPU" : ""}. ${fmt(g.watch)} under watch, ${fmt(g.lost)} down.`);
+    const simHalls = st.halls.filter((h) => h !== "L" && h !== "R").length;
+    setRegion("fl-lede", $("#r-flede"), `${fmt(st.size)} GPUs in ${fmt(st.servers)} servers and ${st.racks} racks${simHalls > 1 ? ` across ${simHalls} halls` : ""}${st.local ? ", plus this laptop's GPU" : ""}${st.real ? `, plus ${plural(st.real.servers, "real server")} (${plural(st.real.gpus, "GPU")}) in hall R` : ""}. ${fmt(g.watch)} under watch, ${fmt(g.lost)} down.`);
     if (!S.fleet.hall || !st.halls.includes(S.fleet.hall)) S.fleet.hall = st.halls[0];
     if (S.fleet.rack && S.fleet.rack[0] !== S.fleet.hall && st.halls.includes(S.fleet.rack[0])) S.fleet.hall = S.fleet.rack[0];
     setRegion("fl-halls", $("#r-halls"), st.halls.length > 1 ? `<div class="seg" role="group" aria-label="Hall">${st.halls.map((h) => `<button type="button" data-action="hall" data-id="${h}" aria-pressed="${h === S.fleet.hall}">${hallName(h)}</button>`).join("")}</div>` : "");
@@ -486,14 +511,15 @@ async function loadRack() {
   try {
     const [rack, gpu] = await Promise.all([
       api(`/api/rack/${S.fleet.rack}`),
-      S.fleet.server ? api(`/api/gpu/${S.fleet.server}/${S.fleet.gpu ?? 0}`).catch(() => null) : null,
+      S.fleet.server ? api(`/api/gpu/${encodeURIComponent(S.fleet.server)}/${S.fleet.gpu ?? 0}`).catch(() => null) : null,
     ]);
     S.rack = rack;
     if (!S.fleet.server || !rack.servers.some((s) => s.name === S.fleet.server)) {
-      const pick = rack.servers.flatMap((s) => s.gpus.map((g) => ({ s, g }))).find(({ g }) => g.lost || g.sbe_rising || g.nvlink_rising || g.temp >= 83) ||
-        { s: rack.servers[0], g: rack.servers[0].gpus[0] };
+      const all = rack.servers.flatMap((s) => s.gpus.map((g) => ({ s, g })));
+      const pick = all.find(({ g }) => g.lost || g.watch || g.sbe_rising || g.nvlink_rising || g.temp >= 83) || all[0] ||
+        { s: rack.servers[0], g: { index: 0 } };
       S.fleet.server = pick.s.name; S.fleet.gpu = pick.g.index;
-      S.gpuDetail = await api(`/api/gpu/${S.fleet.server}/${S.fleet.gpu}`).catch(() => null);
+      S.gpuDetail = await api(`/api/gpu/${encodeURIComponent(S.fleet.server)}/${S.fleet.gpu}`).catch(() => null);
     } else {
       S.gpuDetail = gpu;
     }
@@ -503,26 +529,29 @@ async function loadRack() {
 function renderRack() {
   const rack = S.rack;
   if (!rack || S.route.name !== "fleet") return;
-  $("#rk-h").textContent = rack.local ? "This computer" : `Rack ${rack.id}`;
+  $("#rk-h").textContent = rack.local ? "This computer" : rack.real ? `Real servers, rack ${rack.id}` : `Rack ${rack.id}`;
+  const kube = S.state && S.state.real && S.state.real.kube;
   const flow = rack.local ? "Real readings from nvidia-smi every 2 s. Fixes need your approval." :
+    rack.real ? `Real DCGM readings${kube ? " and Kubernetes. Steps need your approval and are rehearsed with a Kubernetes dry run." : ". Kubernetes isn't connected, so Nightingale only watches."}` :
     rack.flow < 90 ? `<span class="pill attn">Coolant flow ${rack.flow}%</span>` : `${rack.cdu}: flow ${rack.flow}%, return ${rack.return_temp}°C`;
   setRegion("fl-rkhint", $("#r-rkhint"), flow);
   const rows = rack.servers.map((s) => {
-    let state = s.local ? shortGpu(s.model) : s.jobs.join(", ") || "Spare, ready", cls = s.jobs.length || s.local ? "" : "ok";
-    if (s.status === "drained") { state = s.ticket ? "Drained, waiting on repair" : "Drained"; cls = "attn"; }
+    let state = s.local ? shortGpu(s.model) : s.jobs.join(", ") || (s.real ? `${shortGpu(s.model)}, idle` : "Spare, ready"), cls = s.jobs.length || s.local || s.real ? "" : "ok";
+    if (s.status === "drained") { state = s.real ? (s.ticket ? "Cordoned, waiting on repair" : "Cordoned") : s.ticket ? "Drained, waiting on repair" : "Drained"; cls = "attn"; }
+    if (s.real && s.ready === false) { state = "NotReady in Kubernetes"; cls = "bad"; }
     if (s.status === "rebooting") { state = "Rebooting"; cls = "attn"; }
     if (s.gpus.some((g) => g.lost)) cls = "bad";
     const tiles = s.gpus.map((g) => {
-      const code = s.local ? (g.lost ? "x" : g.watch ? "w" : "b") :
+      const code = s.local || s.real ? (g.lost ? "x" : g.watch ? "w" : s.status === "drained" ? "d" : "b") :
         g.lost ? "x" : (g.sbe_rising || g.nvlink_rising || g.remap_pending || g.throttle === "HW_THERMAL_SLOWDOWN" || g.temp >= 83) ? "w" : s.status === "rebooting" ? "r" : s.status === "drained" ? "d" : "b";
       const bg = cellColor(code, g.temp);
       const c = code === "x" ? RED : code === "w" ? WATCH : heatRgb(g.temp);
       const fg = code === "x" || code === "w" || lum(c) > 0.22 ? "#05070a" : "#ecf0f2";
       const sel = s.name === S.fleet.server && g.index === S.fleet.gpu;
-      const label = `${s.name} GPU ${g.index}, ${g.lost ? "not responding" : `${Math.round(g.temp)} degrees, ${g.power} watts`}${code === "w" ? ", under watch" : ""}`;
+      const label = `${s.name} GPU ${g.index}, ${g.lost ? "not responding" : `${Math.round(g.temp)} degrees, ${g.power} watts`}${code === "w" ? `, under watch${g.why ? `: ${g.why}` : ""}` : ""}`;
       return `<button class="tile" type="button" style="--c:${bg};--fg:${fg}" data-action="gpu" data-server="${s.name}" data-gpu="${g.index}" aria-pressed="${sel}" aria-label="${esc(label)}">${g.lost ? "Lost" : `${Math.round(g.temp)}°`}</button>`;
     }).join("");
-    return `<div class="server"><div><div class="name">${s.local ? "Laptop" : s.name}</div><div class="state ${cls}">${esc(state)}</div></div><div class="tiles">${tiles}</div></div>`;
+    return `<div class="server"><div><div class="name">${s.local ? "Laptop" : esc(s.name)}</div><div class="state ${cls}">${esc(state)}</div></div><div class="tiles">${tiles}</div></div>`;
   }).join("");
   let extra = "";
   if (rack.local) {
@@ -537,6 +566,19 @@ function renderRack() {
       <hr class="divider"><div class="card-head"><h3>Latest from this laptop</h3><a class="link small" href="#/logs">All logs</a></div>
       <div class="logbox mini">${lines.length ? lines.map((l) => `<div class="logline ${l.level}"><span class="ts">${esc(l.t)}</span> <span class="src">${esc(l.source)}:</span> ${esc(l.text)}</div>`).join("") : '<div class="logline">Nothing logged yet.</div>'}</div>`;
   }
+  if (rack.real) {
+    const names = new Set(rack.servers.map((s) => s.name));
+    const lines = S.logs.filter((l) => names.has(l.node)).slice(-7).reverse();
+    extra = `<hr class="divider"><div class="card-head"><h3>What Nightingale watches on real servers</h3></div>
+      <dl class="watchlist">
+        <div><dt>Xid errors</dt><dd>New driver errors DCGM reports, like 79 (GPU fell off the bus) or 48 and 94/95 (memory).</dd></div>
+        <div><dt>Memory health</dt><dd>Uncorrectable ECC errors, corrected errors that keep rising, and pending row remaps.</dd></div>
+        <div><dt>Heat and links</dt><dd>Heat slowdown under load, and NVLink errors that keep rising.</dd></div>
+        <div><dt>Kubernetes</dt><dd>Nodes going NotReady, GPUs that stop reporting, and GPU workloads that crash or restart.</dd></div>
+      </dl>
+      <hr class="divider"><div class="card-head"><h3>Latest from these servers</h3><a class="link small" href="#/logs">All logs</a></div>
+      <div class="logbox mini">${lines.length ? lines.map((l) => `<div class="logline ${l.level}"><span class="ts">${esc(l.t)}</span> <span class="src">${esc(l.node)} ${esc(l.source)}:</span> ${esc(l.text)}</div>`).join("") : '<div class="logline">Nothing logged yet.</div>'}</div>`;
+  }
   setRegion("fl-servers", $("#r-servers"), `<div class="servers">${rows}</div>${extra}`);
   renderGpu();
 }
@@ -544,6 +586,7 @@ function renderGpu() {
   const d = S.gpuDetail;
   if (!d) return;
   if (d.local) return renderLocalGpu(d);
+  if (d.real) return renderRealGpu(d);
   const busy = !!d.job;
   const tLevel = d.temp >= 87 ? "crit" : d.temp >= 83 ? "watch" : "ok";
   const mg = d.lost ? [] : [
@@ -568,6 +611,44 @@ function renderGpu() {
     </div>
     <div><div class="seg" role="group" aria-label="History metric">${metrics.map(([k, l]) => `<button type="button" data-action="metric" data-id="${k}" aria-pressed="${k === metric}">${l}</button>`).join("")}</div>
       <div style="margin-top:10px">${lineChart(pts, { label: `GPU ${m[2]} over the last minute`, floor: 0, minSpan: metric === "temp" ? 10 : 4, color: (metric === "sbe" && d.sbe_rising) || (metric === "nvlink_crc" && d.nvlink_rising) || (metric === "temp" && d.temp >= 83) ? "var(--watch)" : "var(--accent)" })}</div></div>
+    ${memory}
+    ${inc ? `<a class="btn" href="#/incidents/${inc.id}">Open the incident on ${esc(targetName(inc.target))}</a>` : ""}
+  </div>`);
+}
+
+const XID_TEXT = { 13: "graphics engine exception", 31: "memory page fault", 43: "GPU stopped processing", 45: "cleanup after an earlier error",
+  48: "double-bit ECC error", 61: "micro-controller breakpoint", 62: "micro-controller halt", 63: "row remap recorded", 64: "row remap failed",
+  74: "NVLink error", 79: "fell off the bus", 92: "high single-bit ECC rate", 94: "contained ECC error", 95: "uncontained ECC error",
+  109: "context switch timeout", 119: "GSP timeout", 120: "GSP error", 154: "recovery action changed" };
+function renderRealGpu(d) {
+  const thermal = (d.reasons || []).some((r) => r.includes("THERMAL")) && (d.util >= 30 || d.reasons.includes("HW_THERMAL_SLOWDOWN"));
+  const maxW = d.power_max || d.power_limit || 1;
+  const mg = d.lost ? [] : [
+    { label: "Temperature", center: `${Math.round(d.temp)}°`, unit: "C", frac: d.temp / 100, level: d.temp >= 87 ? "crit" : d.temp >= 83 || thermal ? "watch" : "ok" },
+    { label: "Power", center: fmt(d.power), unit: d.power_limit ? `W of ${d.power_limit}` : "W", frac: d.power / maxW, level: "ok" },
+    { label: "SM clock", center: (d.clock / 1000).toFixed(2), unit: "GHz", frac: d.max_clock ? d.clock / d.max_clock : 0, level: thermal ? "watch" : "ok" },
+  ];
+  const metrics = [["temp", "Temp", "temperature"], ["power", "Power", "power"], ["clock", "Clock", "SM clock"], ["util", "Load", "load"], ["sbe", "Memory", "corrected memory errors"]];
+  const metric = metrics.some((m) => m[0] === S.fleet.metric) ? S.fleet.metric : d.sbe_rising ? "sbe" : "temp";
+  const m = metrics.find((x) => x[0] === metric);
+  const pts = d.history.map((h) => ({ v: h.lost ? 0 : h[metric] }));
+  const inc = (S.state?.incidents || []).find((i) => (i.target === d.node || i.target === d.rack) && !["resolved", "closed"].includes(i.status));
+  const recent = d.xid_at && Date.now() / 1000 - d.xid_at < 180;
+  const xid = d.xid ? `${d.xid} (${XID_TEXT[d.xid] || "see NVIDIA's Xid list"})${d.xid_at ? `, ${ago(d.xid_at)}` : ", before Nightingale connected"}` : "None";
+  const reasons = (d.reasons || []).map((r) => REASON_TEXT[r] || r);
+  const memory = d.incidents.length ? `<details class="plain"><summary>Fleet memory: ${plural(d.incidents.length, "earlier incident")}</summary><ul class="timeline">${d.incidents.map((h) => `<li>${esc(h.when)}: ${esc(h.title)}. ${esc(h.fix)}</li>`).join("")}</ul></details>` : `<p class="small faint">Fleet memory: no incidents on this GPU yet.</p>`;
+  setRegion("fl-gpu", $("#r-gpu"), `<div class="vitals">
+    <div><h2 id="gp-h" style="font-size:17px">${esc(d.node)}, GPU ${d.index} <span class="tag-real">Real</span></h2><p class="small faint">${esc(d.model)}${d.driver ? `, driver ${esc(d.driver)}` : ""}, rack ${esc(d.rack)}${d.pci ? `, PCI ${esc(d.pci)}` : ""}. Kubernetes node ${esc(d.kname)}${d.ready === false ? ", NotReady" : ""}. ${d.job ? `Running ${esc(d.job)}${d.pod ? ` (pod ${esc(d.pod)})` : ""}.` : d.status === "drained" ? "Cordoned." : "Idle."}</p></div>
+    ${d.lost ? `<div class="callout bad">This GPU stopped reporting to DCGM. The server may have lost it (an Xid 79), or its exporter isn't answering.</div>` : `<div class="mini-gauges">${mg.map(miniGauge).join("")}</div>`}
+    <div class="stats">
+      <div class="stat"><div class="k">Last Xid</div><div class="v ${recent ? "bad" : ""}" style="font-size:15px">${esc(xid)}</div></div>
+      <div class="stat"><div class="k">Memory errors</div><div class="v ${d.dbe ? "bad" : d.sbe_rising ? "attn" : ""}" style="font-size:15px">${fmt(d.sbe)} corrected, ${fmt(d.dbe)} uncorrectable${d.remap_pending ? ", remap pending" : ""}</div></div>
+      <div class="stat"><div class="k">Load and memory</div><div class="v" style="font-size:15px">${fmt(d.util)}%${d.mem_total ? `, ${(d.mem_used / 1024).toFixed(1)} of ${(d.mem_total / 1024).toFixed(1)} GB` : ""}</div></div>
+      <div class="stat"><div class="k">Slowing down because</div><div class="v ${thermal ? "attn" : ""}" style="font-size:15px">${esc(reasons.join(", ") || "Nothing")}</div></div>
+    </div>
+    ${d.issues && d.issues.length ? `<div class="callout">${d.issues.map(esc).join("<br>")}</div>` : ""}
+    <div><div class="seg" role="group" aria-label="History metric">${metrics.map(([k, l]) => `<button type="button" data-action="metric" data-id="${k}" aria-pressed="${k === metric}">${l}</button>`).join("")}</div>
+      <div style="margin-top:10px">${lineChart(pts, { label: `GPU ${m[2]} over the last minute`, floor: 0, minSpan: metric === "temp" ? 10 : 4, color: (metric === "temp" && (d.temp >= 83 || thermal)) || (metric === "sbe" && d.sbe_rising) ? "var(--watch)" : "var(--accent)" })}</div></div>
     ${memory}
     ${inc ? `<a class="btn" href="#/incidents/${inc.id}">Open the incident on ${esc(targetName(inc.target))}</a>` : ""}
   </div>`);
@@ -705,10 +786,11 @@ function traceHtml(inc) {
 
 function dryHtml(inc) {
   const d = inc.dry_run;
-  const word = d.checked ? (d.verdict === "fail" ? "A step can't run right now" : "Checked on your computer") : { pass: "Dry run passed", warn: "Dry run passed with warnings", fail: "Dry run failed" }[d.verdict];
+  const word = d.kind === "kubernetes" ? (d.verdict === "fail" ? "Kubernetes refused a step in the dry run" : "Kubernetes accepted every step in a dry run")
+    : d.checked ? (d.verdict === "fail" ? "A step can't run right now" : "Checked on your computer") : { pass: "Dry run passed", warn: "Dry run passed with warnings", fail: "Dry run failed" }[d.verdict];
   const lines = d.steps.map((s) => `<li class="${s.ok ? "" : "no"}"><span class="pill ${!s.ok ? "bad" : s.locked ? "serious" : "good"}">${!s.ok ? (d.checked ? "Problem" : "Blocked") : s.locked ? "Locked" : "OK"}</span><span>${esc(s.label)}. ${esc(s.result)}</span></li>`).join("");
   const first = d.first_attempt ? `<details class="plain"><summary>The first plan failed its dry run, so Nemotron revised it</summary><ul class="timeline">${d.first_attempt.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></details>` : "";
-  return `<div class="dry ${d.verdict}"><h3>${esc(word)}</h3><p>${esc(d.summary)}</p><details class="plain"><summary>${d.checked ? "What was checked for each step" : "What happened to each step on the copy"}</summary><ul style="margin-top:6px">${lines}</ul></details>${first}</div>`;
+  return `<div class="dry ${d.verdict}"><h3>${esc(word)}</h3><p>${esc(d.summary)}</p><details class="plain"><summary>${d.kind === "kubernetes" ? "What Kubernetes said about each step" : d.checked ? "What was checked for each step" : "What happened to each step on the copy"}</summary><ul style="margin-top:6px">${lines}</ul></details>${first}</div>`;
 }
 
 function stepsHtml(inc) {
@@ -844,7 +926,7 @@ function sourcesHtml(st, full) {
     return `<div class="mini-list">
       <div><span class="what"><b>Simulated data center</b><span class="sub">${fmt(st.size)} GPUs, failure drills</span></span><span class="pill solid">Connected</span></div>
       <div><span class="what"><b>This laptop's GPU</b><span class="sub">${loc ? esc(shortGpu(loc.name)) + ", fixes need your approval" : S.localError ? esc(S.localError) : "Real readings from nvidia-smi"}</span></span>${lapRight}</div>
-      <div><span class="what"><b>DCGM + Prometheus, Nebius AI Cloud GPU</b><span class="sub">Real data center telemetry</span></span><span class="pill">Planned</span></div>
+      <div><span class="what"><b>Real GPU servers</b><span class="sub">${st.real ? `${plural(st.real.servers, "server")}, ${plural(st.real.gpus, "GPU")} through DCGM${st.real.kube ? " and Kubernetes" : ", watch only"}` : "DCGM and Kubernetes, from a real data center"}</span></span>${st.real ? `<span class="pill ${st.real.state === "ok" ? "solid" : "bad"}">${st.real.state === "ok" ? "Connected" : "Reading error"}</span>` : '<a class="btn small" href="#/sources">Connect</a>'}</div>
     </div>`;
   }
   const choice = S.sizeChoice || st.size;
@@ -865,8 +947,35 @@ function sourcesHtml(st, full) {
       ${S.localError ? `<p class="small src-error">${esc(S.localError)}</p>` : ""}
       <div class="toolbar"><button class="btn small primary" type="button" data-action="local-on">${S.localBusy ? "Connecting…" : "Connect"}</button></div></div>`;
   }
-  const planned = (name, detail) => `<div class="srcard planned"><div class="srcard-head"><div><b>${name}</b><span>${detail}</span></div><span class="pill">Planned</span></div></div>`;
-  return `<div class="sources ${full ? "full" : ""}">${sim}${lap}${planned("DCGM + Prometheus", "Any NVIDIA data center, read-only to start.")}${planned("Nebius AI Cloud GPU", "A rented H100 or L40S with real DCGM telemetry.")}</div>`;
+  return `<div class="sources ${full ? "full" : ""}">${sim}${lap}${realCard(st)}</div>`;
+}
+function realCard(st) {
+  const r = st.real;
+  if (r) {
+    const bad = r.state !== "ok";
+    const when = r.read_at ? `last read ${ago(r.read_at)}` : "";
+    return `<div class="srcard ${bad ? "bad" : "on"}"><div class="srcard-head"><div><b>Real GPU servers</b><span>${plural(r.servers, "server")}, ${plural(r.gpus, "GPU")}: DCGM from ${esc(r.where)}</span></div>
+      <span class="pill ${bad ? "bad" : "solid"}">${bad ? "Reading error" : "Connected"}</span></div>
+      <p class="small faint">${bad ? esc(r.error) : `${r.kube ? `Kubernetes at ${esc(r.kube_where)}: approved plans can cordon nodes, move jobs and run nvidia-smi, each rehearsed with a Kubernetes dry run first.` : `Watching only. ${esc(r.kube_note || "Kubernetes isn't connected.")}`} ${when ? `Every ${r.interval} s, ${when}.` : ""}`}${r.kube_error ? ` <span class="src-error">${esc(r.kube_error)}</span>` : ""}</p>
+      <div class="toolbar"><a class="btn small" href="#/fleet?rack=${(r.racks || [])[0] || "R-01"}">Open in Fleet</a>${st.fleet_ui_connect ? '<button class="btn small quiet" type="button" data-action="fleet-off">Disconnect</button>' : ""}</div></div>`;
+  }
+  if (!st.fleet_ui_connect) {
+    return `<div class="srcard"><div class="srcard-head"><div><b>Real GPU servers</b><span>DCGM readings and Kubernetes from a real data center</span></div></div>
+      <p class="small faint">Connecting real servers is turned off on this deployment. Run Nightingale yourself with <code>FLEET_DCGM</code> set (see the README).</p></div>`;
+  }
+  return `<div class="srcard"><div class="srcard-head"><div><b>Real GPU servers</b><span>DCGM readings from a real data center, plus Kubernetes so approved plans can act</span></div></div>
+    <form class="fleet-form" data-form="fleet">
+      <label for="fleet-url">Where the DCGM readings are</label>
+      <input id="fleet-url" name="url" type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:9400/metrics">
+      <p class="small faint">A dcgm-exporter <code>/metrics</code> URL (several, comma separated), a Prometheus URL like <code>http://prometheus:9090</code>, or <code>auto</code> to find every dcgm-exporter in the Kubernetes cluster.</p>
+      <label for="fleet-kube">Kubernetes</label>
+      <select id="fleet-kube" name="kube"><option value="auto">Use it if a kubeconfig works (approved plans can act)</option><option value="off">Off: watch only</option></select>
+      ${S.fleetError ? `<p class="small src-error">${esc(S.fleetError)}</p>` : ""}
+      <div class="toolbar"><button class="btn small primary" type="submit">${S.fleetBusy ? "Connecting…" : "Connect"}</button></div>
+    </form>
+    <details class="plain"><summary>Try it on this laptop, or on a rented NVIDIA GPU</summary>
+      <p class="small">On this laptop: run <code>python -m app.dcgm_bridge</code> in the Nightingale folder. It serves your GPU in DCGM's format at <code>http://127.0.0.1:9400/metrics</code>. Paste that above with Kubernetes off.</p>
+      <p class="small">On a real GPU server: <code>deploy/nebius/setup.sh</code> installs Kubernetes, NVIDIA's GPU Operator (with DCGM) and Nightingale on one rented Nebius AI Cloud GPU and connects them with <code>FLEET_DCGM=auto</code>.</p></details></div>`;
 }
 const DRILL_TEXT = {
   thermal: "One GPU's cooling starts failing. It heats up, throttles, and slows its whole training job.",
@@ -879,13 +988,15 @@ const DRILL_TEXT = {
 VIEWS.sources = {
   mount: () => `<div class="page">
     <div id="r-banner"></div>
-    <div class="title-row"><div><h1>Data sources</h1><p class="lede">Every source feeds the same agent. Mix them freely: the simulated data center for drills, and this laptop's real GPU.</p></div></div>
+    <div class="title-row"><div><h1>Data sources</h1><p class="lede">Every source feeds the same agent. Mix them freely: the simulated data center for drills, this laptop's real GPU, and real GPU servers through DCGM and Kubernetes.</p></div></div>
     <section class="card" aria-labelledby="src-h"><div class="card-head"><h2 id="src-h">Sources</h2></div><div id="r-srcs"></div></section>
     <section class="card" aria-labelledby="dr-h"><div class="card-head"><h2 id="dr-h">Failure drills</h2><span class="hint">In the simulated data center. Then open Overview to follow it.</span></div>
       <div class="drills" id="r-drills"></div><hr class="divider"><div class="card-head"><h3>Drills run</h3></div><div id="r-dhist"></div></section></div>`,
   update(st) {
     setRegion("si-banner", $("#r-banner"), banner());
     setRegion("si-srcs", $("#r-srcs"), sourcesHtml(st, true));
+    const fi = $("#fleet-url");
+    if (fi && S.fleetUrl && !fi.value) fi.value = S.fleetUrl;
     setRegion("si-drills", $("#r-drills"), Object.entries(st.scenarios).map(([k, label]) => `<div class="drill"><b>${esc(label)}</b><p>${esc(DRILL_TEXT[k] || "")}</p>
       <button class="btn" type="button" data-action="drill" data-id="${k}">Start drill</button></div>`).join(""));
     const drills = st.drills.slice().reverse();
@@ -977,11 +1088,24 @@ async function askQuestion(q) {
   } catch (e) { S.asking = false; toast(e.message); }
   await pollAsks();
 }
+async function connectFleet(form) {
+  if (S.fleetBusy) return;
+  S.fleetUrl = form.url.value.trim();
+  S.fleetBusy = true; S.fleetError = ""; render();
+  try {
+    const r = await api("/api/fleet", { method: "POST", body: { url: S.fleetUrl, kube: form.kube.value } });
+    toast(r.message); S.fleetUrl = "";
+  } catch (e2) { S.fleetError = e2.message; }
+  S.fleetBusy = false;
+  await poll();
+}
 document.addEventListener("input", (e) => {
+  if (e.target && e.target.id === "fleet-url") S.fleetUrl = e.target.value;
   const k = e.target && e.target.dataset && e.target.dataset.param;
   if (k) S.pcParams[k] = e.target.value;
 });
 document.addEventListener("submit", (e) => {
+  if (e.target.dataset && e.target.dataset.form === "fleet") { e.preventDefault(); connectFleet(e.target); return; }
   if (e.target.id !== "ask-form") return;
   e.preventDefault();
   askQuestion($("#ask-q").value);
@@ -1329,6 +1453,7 @@ document.addEventListener("click", async (ev) => {
     else if (a === "drill") { el.disabled = true; const r = await api("/api/inject", { method: "POST", body: { kind: id } }); toast(`Drill started: ${r.label} on ${targetName(r.target)}${r.gpu !== null ? `, GPU ${r.gpu}` : ""}. Nightingale doesn't know which.`); await poll(); el.disabled = false; }
     else if (a === "size") { S.sizeChoice = Number(id); VIEWS.sources.update(S.state); }
     else if (a === "local-on") { S.localBusy = true; S.localError = ""; render(); try { const r = await api("/api/local", { method: "POST", body: { enabled: true } }); toast(r.message); } catch (e2) { S.localError = e2.message; } S.localBusy = false; await poll(); }
+    else if (a === "fleet-off") { el.disabled = true; await api("/api/fleet", { method: "POST", body: { enabled: false } }); toast("Disconnected from the real servers."); if (S.fleet.hall === "R") S.fleet = { hall: null, rack: null, server: null, gpu: null, metric: null }; await poll(); }
     else if (a === "local-off") { el.disabled = true; await api("/api/local", { method: "POST", body: { enabled: false } }); toast("Disconnected from this laptop's GPU."); if (S.fleet.hall === "L") S.fleet = { hall: null, rack: null, server: null, gpu: null, metric: null }; await poll(); }
     else if (a === "reset") { el.disabled = true; const r = await api("/api/reset", { method: "POST", body: { size: S.sizeChoice || S.state.size } }); S.sizeChoice = null; S.logs = []; S.lastLogId = 0; S.fleet = { hall: null, rack: null, server: null, gpu: null, metric: null }; toast(`Restarted with ${fmt(r.size)} GPUs. Everything is healthy again.`); await poll(); }
     else if (a === "logsrc") { S.logFilter.source = id; document.querySelectorAll('[data-action="logsrc"]').forEach((b) => b.setAttribute("aria-pressed", b.dataset.id === id)); renderLogs(true); }
@@ -1403,6 +1528,7 @@ $("#search").addEventListener("submit", (e) => {
   if (server) { const name = `dgx-${String(server[1]).padStart(4, "0")}`; location.hash = `#/fleet?rack=${rackOfServer(name)}&server=${name}`; }
   else if (rack) location.hash = `#/fleet?rack=${rack[1].toUpperCase()}-${rack[2].padStart(2, "0")}`;
   else if (/^(laptop|this (laptop|computer)|local|my computer)$/i.test(v)) location.hash = "#/pc";
+  else if (isReal(v)) location.hash = `#/fleet?rack=${realRack(v)}&server=${encodeURIComponent(v)}`;
   else if (S.state.jobs.some((j) => j.id === v)) location.hash = "#/overview";
   else return toast(`Nothing called "${v}". Try a server like dgx-0053, a rack like A-07${S.state.local ? ", or laptop" : ""}.`);
   $("#search-input").value = "";

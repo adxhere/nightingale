@@ -11,6 +11,10 @@ real operator would see: telemetry, logs, and the answers of read-only tools.
 The data center can also hold one real machine: this computer's own GPU, read through
 nvidia-smi (see local_gpu.py). It appears as server "laptop" in hall L. Fixes on it come from
 pc_actions.py, run only after the person approves them, and depend on light or serious mode.
+
+And it can hold real GPU servers: DCGM readings and Kubernetes state (see fleet.py and
+fleet_sync.py), in hall R. Nothing about them is simulated, and approved steps on them act on the
+real cluster through Kubernetes.
 """
 from __future__ import annotations
 
@@ -23,6 +27,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from .fleet_sync import FLEET_HALL, FleetMixin
 
 GPUS_PER_NODE = 8
 NODES_PER_RACK = 8
@@ -106,6 +112,14 @@ class GPU:
     fan: int | None = None
     reasons: tuple = ()
     policy_flags: tuple = ()   # slowdown flags the laptop raises while idle and cool (see LOCAL_BUSY)
+    # Only read from a real data center GPU (DCGM):
+    power_min: int | None = None
+    power_default: int | None = None
+    xid: int = 0               # last Xid DCGM reported
+    xid_at: float = 0.0        # when Nightingale saw it happen (0: from before it connected)
+    uuid: str = ""
+    pod: str = ""              # namespace/pod using it, when dcgm-exporter maps pods
+    extra: dict = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -119,6 +133,10 @@ class Node:
     local: bool = False     # True for this computer's own, real GPU
     model: str = "H100 SXM"
     driver: str = ""
+    real: bool = False      # True for a real data center server (DCGM + Kubernetes)
+    ready: bool = True      # Kubernetes node Ready condition (real servers)
+    ready_reason: str = ""
+    kname: str = ""         # its Kubernetes name, when it differs from the name shown here
 
 
 @dataclass(slots=True)
@@ -147,6 +165,11 @@ class Job:
     restart_left: int = 0
     last_error: str = ""
     owner_notified: bool = False
+    real: bool = False      # a real Kubernetes workload (owner is its namespace)
+    namespace: str = ""
+    pods: list = field(default_factory=list)
+    gpus: int = 0
+    controller: str = ""
 
 
 @dataclass(slots=True)
@@ -162,7 +185,7 @@ class Fault:
     flags: dict = field(default_factory=dict)
 
 
-class Cluster:
+class Cluster(FleetMixin):
     def __init__(self, size: int = 1024, seed: int | None = None) -> None:
         self.size = clamp_size(size)
         self.seed = seed
@@ -173,6 +196,8 @@ class Cluster:
         self.window_signal: set = set()
         self.local_activity = ""   # e.g. "a stress test the person started is running on purpose"
         self.selftests: list = []  # recent self-test results on this computer
+        self.fleet = None  # a RealFleet when real GPU servers are connected
+        self._fleet_reset_state()
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -206,6 +231,9 @@ class Cluster:
             self._seed_fleet()
             if self.local is not None:
                 self._add_local_node()
+            if self.fleet is not None:
+                self._fleet_reset_state()
+                self._sync_fleet(record=False, first=True)
             for _ in range(14):  # settle temperatures before the first log line
                 self._update_gpus(record=False)
             self._log("fleet", "nightingale", "info",
@@ -276,6 +304,14 @@ class Cluster:
         if name in self.nodes:
             return name
         low = name.lower()
+        real = self.real_nodes() if self.fleet is not None else []
+        if real:  # real servers: their Kubernetes name, any case, or a unique part of it
+            exact = [n.name for n in real if low in (n.name.lower(), (n.kname or "").lower())]
+            if exact:
+                return exact[0]
+            part = [n.name for n in real if len(low) >= 4 and low in n.name.lower()]
+            if len(part) == 1:
+                return part[0]
         if low in LOCAL_ALIASES or low.replace("_", " ").replace("-", " ") in LOCAL_ALIASES:
             return LOCAL_NODE if LOCAL_NODE in self.nodes else None
         # "dgx-53", "dgx0053", "DGX_0053" or "53"; never glue digits from a GPU number onto the server's.
@@ -290,7 +326,7 @@ class Cluster:
         name = str(name or "").strip().upper().replace("RACK", "").strip()
         if name in self.racks:
             return name
-        if len(name) >= 2 and name[0] in HALL_LETTERS:
+        if len(name) >= 2 and (name[0] in HALL_LETTERS or name[0] == FLEET_HALL):
             digits = "".join(ch for ch in name[1:] if ch.isdigit())
             if digits:
                 guess = f"{name[0]}-{int(digits):02d}"
@@ -325,10 +361,14 @@ class Cluster:
                 and (rack is None or f.rack == rack)]
 
     def is_spare(self, n: Node) -> bool:
-        return not n.local and n.status == "active" and all(g.job is None and not g.lost for g in n.gpus)
+        return (not n.local and not n.real and n.status == "active"
+                and all(g.job is None and not g.lost for g in n.gpus))
+
+    def sim_rack_count(self) -> int:
+        return sum(1 for r in self.racks.values() if r.hall not in (LOCAL_HALL, FLEET_HALL))
 
     def sim_nodes(self) -> list[Node]:
-        return [n for n in self.nodes.values() if not n.local]
+        return [n for n in self.nodes.values() if not n.local and not n.real]
 
     def spare_nodes(self, avoid_rack: str | None = None) -> list[Node]:
         cooling = {f.rack for f in self._unresolved(kind="rack_cooling")}
@@ -351,7 +391,11 @@ class Cluster:
         if params.get("gpu") is not None and not 0 <= params["gpu"] < count:
             return f"GPU index {params['gpu']} is out of range (0-{count - 1})"
         if "job" in params and params["job"] not in self.jobs:
-            return f"unknown job '{params['job']}'"
+            want = str(params["job"]).strip()
+            match = [j for j in self.jobs if j.split("/")[-1] == want.split("/")[-1]]
+            if len(match) != 1:
+                return f"unknown job '{params['job']}'"
+            params["job"] = match[0]
         return None
 
     # ------------------------------------------------------- this computer
@@ -541,6 +585,7 @@ class Cluster:
                 if f.status != "resolved":
                     self._advance_fault(f)
             self._sync_local()
+            self._sync_fleet()
             self._update_gpus()
             self._advance_jobs()
             self._routine_logs()
@@ -570,8 +615,8 @@ class Cluster:
         extra = self._heat()
         rnd = self.rng.uniform
         for node in self.nodes.values():
-            if node.local:
-                continue  # real readings, see _sync_local
+            if node.local or node.real:
+                continue  # real readings, see _sync_local and _sync_fleet
             rebooting = node.status == "rebooting"
             for g in node.gpus:
                 if g.lost or rebooting:
@@ -600,7 +645,7 @@ class Cluster:
                     g.history.append((self.tick_count, round(g.temp), round(g.power), g.clock, g.throttle,
                                       g.sbe, g.dbe, g.nvlink_crc, g.lost, g.util))
         for rack in self.racks.values():
-            if rack.hall == LOCAL_HALL:
+            if rack.hall in (LOCAL_HALL, FLEET_HALL):
                 continue
             hot = [f for f in self._unresolved(kind="rack_cooling") if f.rack == rack.id]
             if hot:
@@ -787,6 +832,8 @@ class Cluster:
     def _advance_jobs(self) -> None:
         nvlink_jobs = {self.nodes[f.node].gpus[f.gpu].job for f in self._unresolved(kind="nvlink")}
         for job in self.jobs.values():
+            if job.real:
+                continue  # its state comes from Kubernetes, see _sync_fleet
             if job.status == "restarting":
                 job.restart_left -= 1
                 if job.restart_left <= 0:
@@ -828,8 +875,8 @@ class Cluster:
         if self.tick_count % 5:
             return
         for hall in self.halls:
-            if hall == LOCAL_HALL:
-                continue  # this computer logs its own readings
+            if hall in (LOCAL_HALL, FLEET_HALL):
+                continue  # this computer and real servers log their own readings
             gpus = [(n, g) for n in self.nodes.values() if n.hall == hall and n.status != "rebooting" for g in n.gpus]
             visible = [(n, g) for n, g in gpus if not g.lost]
             known = sum(1 for n, g in gpus if g.lost and self.has_open_ticket(n.name))
@@ -857,6 +904,10 @@ class Cluster:
                     if self.local_odd(g):
                         rows.append((node, g, d))
                     continue
+                if node.real:
+                    if self.fleet_odd(node, g):
+                        rows.append((node, g, d))
+                    continue
                 odd = (g.lost or g.temp >= 80 or g.throttle == "HW_THERMAL_SLOWDOWN" or any(d) or g.dbe
                        or g.remap_pending)
                 if odd:
@@ -871,6 +922,8 @@ class Cluster:
         """Racks whose working GPUs run clearly hotter than working GPUs elsewhere."""
         temps = {}
         for rack in self.racks.values():
+            if rack.hall in (LOCAL_HALL, FLEET_HALL):
+                continue  # compare simulated racks with each other only
             busy = [g.temp for nm in rack.nodes for g in self.nodes[nm].gpus
                     if self.nodes[nm].status != "rebooting" and self._working(g)]
             if len(busy) >= 16:
@@ -897,12 +950,14 @@ class Cluster:
             drained = [n.name for n in sim if n.status == "drained"]
             rebooting = [n.name for n in sim if n.status == "rebooting"]
             out = [f"Window ending tick {self.tick_count} ({_now().strftime('%H:%M:%S')} UTC)",
-                   f"Fleet: {self.size:,} GPUs in {len(sim)} servers, {len(self.racks) - (LOCAL_RACK in self.racks)} racks; "
+                   f"Fleet: {self.size:,} GPUs in {len(sim)} servers, {self.sim_rack_count()} racks; "
                    f"{visible:,} GPUs visible; drained: {', '.join(drained) or 'none'}; "
                    f"rebooting: {', '.join(rebooting) or 'none'}",
                    f"Known issues already handled (ignore): {self.known_issues() or 'none'}",
                    f"Open incidents (already being investigated): {open_incidents}",
                    "Jobs:"]
+            if self.fleet is not None:
+                out.insert(2, self.fleet_digest_line())
             if LOCAL_NODE in self.nodes:
                 n = self.nodes[LOCAL_NODE]
                 out.insert(2, f"Also watching this computer's own GPU: server {LOCAL_NODE} ({n.model}), real "
@@ -910,6 +965,9 @@ class Cluster:
                               f"flag it when clocks are cut for heat, it disappears, memory fills, or the driver crashes."
                               + (f" Right now {self.local_activity}." if self.local_activity else ""))
             for j in self.jobs.values():
+                if j.real:
+                    out.append(self.fleet_job_line(j))
+                    continue
                 out.append(f"  {j.id}: {j.status}, {len(j.nodes)} servers ({len(j.nodes) * 8:,} GPUs), "
                            f"speed {round(j.rate * 100)}% of baseline" + (f", last error: {j.last_error}" if j.last_error else ""))
             rows = self._anomalies(update_counters=True)
@@ -919,6 +977,9 @@ class Cluster:
             for node, g, d in rows[:40]:
                 if node.local:
                     out.append(self._local_row(node, g))
+                    continue
+                if node.real:
+                    out.append(self._fleet_row(node, g, d))
                     continue
                 if g.lost:
                     out.append(f"  {node.name} [{node.rack}, {node.status}] g{g.index} LOST (not visible on PCIe bus)")
@@ -964,6 +1025,13 @@ class Cluster:
                         "read through nvidia-smi every 2 s. Plan only pc_ fixes and recommend steps for it (see the "
                         "catalog); every fix runs only after the person approves it. No data center jobs run here. "
                         f"GPU limits: power {n.gpus[0].power_limit} W, max SM clock {n.gpus[0].max_clock} MHz.")
+            if target in self.nodes and self.nodes[target].real:
+                return self.fleet_target_summary(self.nodes[target])
+            if target in self.racks and self.racks[target].hall == FLEET_HALL:
+                rack = self.racks[target]
+                return (f"Rack {rack.id} holds real GPU servers ({', '.join(rack.nodes)}), grouped by the "
+                        f"'{rack.cdu}' label. Jobs on it: {', '.join(sorted(self.jobs_on(target))) or 'none'}. "
+                        "No facility sensors are connected for real racks.")
             if target in self.racks:
                 rack = self.racks[target]
                 jobs = sorted(self.jobs_on(target))
@@ -1015,7 +1083,7 @@ class Cluster:
         """(rack, average temperature of its working GPUs, how many) for racks with real load."""
         out = []
         for rack in self.racks.values():
-            if rack.id == LOCAL_RACK:
+            if rack.id == LOCAL_RACK or rack.hall == FLEET_HALL:
                 continue
             busy = [g.temp for nm in rack.nodes for g in self.nodes[nm].gpus
                     if self.nodes[nm].status != "rebooting" and self._working(g)]
@@ -1028,8 +1096,8 @@ class Cluster:
         sim = self.sim_nodes()
         drained = [n.name for n in sim if n.status == "drained"]
         racks = self._rack_temps()
-        lines = [f"Data center: {self.size:,} GPUs in {len(sim)} servers, {len(self.racks) - (LOCAL_RACK in self.racks)} "
-                 f"racks, halls {', '.join(h for h in self.halls if h != 'L')}.",
+        lines = [f"Data center: {self.size:,} GPUs in {len(sim)} servers, {self.sim_rack_count()} "
+                 f"racks, halls {', '.join(h for h in self.halls if h not in (LOCAL_HALL, FLEET_HALL))}.",
                  f"GPU health: {g['healthy']:,} healthy, {g['watch']} under watch, {g['lost']} down "
                  f"(not visible on the bus). Spare servers ready: {len(self.spare_nodes())}. "
                  f"Drained: {', '.join(drained) if drained else 'none'}.",
@@ -1047,6 +1115,13 @@ class Cluster:
             + (f", last error: {j.last_error}" if j.last_error else "") for j in self.jobs.values()) + ".")
         open_t = [t for t in self.tickets if t["status"] == "open"]
         lines.append("Open repair tickets: " + ("; ".join(f"{t['id']} {t['summary'].rstrip('.')}" for t in open_t) or "none") + ".")
+        if self.fleet is not None:
+            fs = self.fleet_status()
+            lines.append(f"Real servers (hall {FLEET_HALL}, DCGM from {fs['where']}"
+                         + (", Kubernetes connected" if fs["kube"] else ", Kubernetes not connected") + "): "
+                         f"{fs['servers']} servers, {fs['gpus']} GPUs, {fs['watch']} under watch, {fs['lost']} not reporting"
+                         + (f", cordoned: {', '.join(fs['cordoned'])}" if fs["cordoned"] else "")
+                         + (f", reading error: {fs['error']}" if fs["state"] != "ok" and fs["error"] else "") + ".")
         loc = self.local_status()
         if loc:
             n = self.nodes.get(LOCAL_NODE)
@@ -1070,14 +1145,15 @@ class Cluster:
         rows.sort(key=lambda r: -r[0])
         unit = {"temp": "C", "power": " W", "util": "%"}.get(metric, "")
         return f"Top {count} GPUs by {metric}:\n" + "\n".join(
-            f"  {n.name} GPU {g.index} ({'this computer' if n.local else 'rack ' + n.rack}): {metric}={v:.0f}{unit}"
+            f"  {n.name} GPU {g.index} ({'this computer' if n.local else ('real server, rack ' if n.real else 'rack ') + n.rack}): {metric}={v:.0f}{unit}"
             + ("" if metric == "temp" else f", temp {g.temp:.0f}C") + f", load {g.util}%, job {g.job or 'none'}"
             for v, n, g in rows[:count])
 
     def _node_or_error(self, node) -> tuple[Node | None, str]:
         canon = self.canonical_node(node)
         if not canon:
-            return None, f"No server called '{node}'. Servers are named like dgx-0053."
+            real = f" Real servers: {', '.join(n.name for n in self.real_nodes()[:8])}." if self.fleet is not None else ""
+            return None, f"No server called '{node}'. Servers are named like dgx-0053.{real}"
         return self.nodes[canon], ""
 
     def _tool_node_status(self, node, **_) -> str:
@@ -1086,6 +1162,8 @@ class Cluster:
             return err
         if n.local:
             return self._local_status(n)
+        if n.real:
+            return self.fleet_node_text(n)
         lines = [f"{n.name}: rack {n.rack}, hall {n.hall}, status {n.status}, jobs {', '.join(sorted(self.jobs_on(n.name))) or 'none'}"]
         for g in n.gpus:
             if g.lost or n.status == "rebooting":
@@ -1105,7 +1183,7 @@ class Cluster:
             g = n.gpus[gi]
         except (ValueError, IndexError):
             return f"gpu must be 0-{len(n.gpus) - 1}"
-        lines = [f"{n.name} g{gi}, one sample every 2 s:"]
+        lines = [f"{n.name} g{gi}, one sample every 2 s" + (" (DCGM refreshes its readings every few seconds)" if n.real else "") + ":"]
         for h in list(g.history)[-15:]:
             tick, temp, power, clock, thr, sbe, dbe, nvl, lost = h[:9]
             util = h[9] if len(h) > 9 else 0
@@ -1113,6 +1191,9 @@ class Cluster:
                 lines.append(f"  tick {tick}: LOST")
             elif n.local:
                 lines.append(f"  tick {tick}: temp={temp}C power={power}W clock={clock}MHz load={util}% throttle={thr}")
+            elif n.real:
+                lines.append(f"  tick {tick}: temp={temp}C power={power}W clock={clock}MHz load={util}% throttle={thr} "
+                             f"sbe={sbe} dbe={dbe} nvlink_crc={nvl}")
             else:
                 lines.append(f"  tick {tick}: temp={temp}C power={power}W clock={clock}MHz throttle={thr} "
                              f"sbe={sbe} dbe={dbe} nvlink_crc={nvl}")
@@ -1148,9 +1229,12 @@ class Cluster:
         if rid == LOCAL_RACK:
             return (f"{LOCAL_NODE} is a single computer, not part of a data center rack. Compare it with its own "
                     "recent readings instead (gpu_history), and check what is using it (gpu_processes).")
-        fleet = [g.temp for n in self.nodes.values() for g in n.gpus if g.job and not g.lost and n.status == "active"]
+        hall = self.racks[rid].hall
+        fleet = [g.temp for n in self.nodes.values() if (n.hall == FLEET_HALL) == (hall == FLEET_HALL)
+                 for g in n.gpus if g.job and not g.lost and n.status == "active"]
         favg = sum(fleet) / len(fleet) if fleet else 0
-        lines = [f"Rack {rid} ({self.racks[rid].cdu}); busy GPUs across the fleet average {favg:.0f}C:"]
+        lines = [f"Rack {rid} ({self.racks[rid].cdu}); busy GPUs across the "
+                 f"{'real servers' if hall == FLEET_HALL else 'fleet'} average {favg:.0f}C:"]
         for nm in self.racks[rid].nodes:
             n = self.nodes[nm]
             vis = [g for g in n.gpus if not g.lost]
@@ -1169,6 +1253,8 @@ class Cluster:
         j = self.jobs.get(str(job))
         if not j:
             return f"No job '{job}'. Jobs: {', '.join(self.jobs)}."
+        if j.real:
+            return self.fleet_job_text(j)
         slow = None
         for nm in j.nodes:
             for g in self.nodes[nm].gpus:
@@ -1189,6 +1275,9 @@ class Cluster:
         j = self.jobs.get(str(job))
         if not j:
             return f"No job '{job}'."
+        if j.real:
+            return (f"{j.id} is a real Kubernetes workload; Nightingale doesn't see its rank layout. Its pods: "
+                    + ", ".join(f"{p['name']} on {p['node'] or '(not scheduled)'}" for p in j.pods[:8]) + ".")
         try:
             r = int(rank)
         except ValueError:
@@ -1199,6 +1288,14 @@ class Cluster:
         return f"{j.id} rank {r} runs on {nm} (rack {self.nodes[nm].rack}) GPU {r % 8}."
 
     def _tool_find_spares(self, count=1, avoid_rack=None, **_) -> str:
+        avoid = self.canonical_rack(avoid_rack) if avoid_rack else None
+        if not avoid and avoid_rack and self.canonical_node(avoid_rack):
+            avoid = self.nodes[self.canonical_node(avoid_rack)].rack
+        if avoid and self.racks[avoid].hall == FLEET_HALL:
+            free = self.fleet_free_gpus()
+            return ("Real servers: Kubernetes decides where evicted pods go (any healthy, uncordoned, Ready node "
+                    "with free GPUs). " + ("Free GPUs now: " + ", ".join(f"{nm} ({k} free)" for nm, k in free) + "."
+                                           if free else "No real server has free GPUs right now."))
         spares = self.spare_nodes(self.canonical_rack(avoid_rack) if avoid_rack else None)
         try:
             k = max(1, min(8, int(count)))
@@ -1235,6 +1332,9 @@ class Cluster:
         rid = self.canonical_rack(t) or (self.nodes[self.canonical_node(t)].rack if self.canonical_node(t) else None)
         if not rid:
             return f"No rack called '{t}'."
+        if self.racks[rid].hall == FLEET_HALL:
+            return (f"No facility sensors (coolant loops, power distribution) are connected for real rack {rid}. "
+                    "Check the GPUs' own temperatures, clocks and slowdown reasons instead (node_status, gpu_history).")
         if rid == LOCAL_RACK:
             fans = ", ".join(f"g{g.index} fan {g.fan}%" if g.fan is not None else f"g{g.index} fan not reported"
                              for g in self.nodes[LOCAL_NODE].gpus)
@@ -1258,6 +1358,11 @@ class Cluster:
         n, err = self._node_or_error(node or LOCAL_NODE)
         if err:
             return err
+        if n.real:
+            used = [(g.index, g.pod or g.job) for g in n.gpus if g.pod or g.job]
+            return (f"Workloads on the GPUs of real server {n.name}: " +
+                    (", ".join(f"GPU {i}: {w}" for i, w in used) if used else "none right now") +
+                    ". Use job_info for a workload's pods.")
         if not n.local:
             return (f"{n.name} is a data center server: it runs scheduled jobs, not desktop programs. "
                     "Use job_info for what runs there.")
@@ -1274,6 +1379,8 @@ class Cluster:
     def observed_issues(self, target: str) -> list[str]:
         """Problems visible right now, used to verify a fix and in dry runs."""
         with self.lock:
+            if target in self.racks and self.racks[target].hall == FLEET_HALL:
+                return [f"{nm}: {i}" for nm in self.racks[target].nodes for i in self.fleet_issues(self.nodes[nm])]
             if target in self.racks:
                 rack = self.racks[target]
                 issues = []
@@ -1287,6 +1394,8 @@ class Cluster:
             node = self.nodes[target]
             if node.local:
                 return self._local_issues(node)
+            if node.real:
+                return self.fleet_issues(node)
             if node.status == "rebooting":
                 return ["server is still rebooting"]
             issues = []
@@ -1314,6 +1423,8 @@ class Cluster:
 
     # ---------------------------------------------------------- operations
     def set_power_limit(self, node: str, gpu: int, watts: int) -> tuple[bool, str]:
+        if self.is_real(node):
+            return self.real_power_limit(node, gpu, watts)
         with self.lock:
             g = self.nodes[node].gpus[gpu]
             if g.lost:
@@ -1323,6 +1434,8 @@ class Cluster:
             return True, f"GPU {gpu} on {node} is now capped at {g.power_limit} W."
 
     def set_rack_power_limit(self, rack: str, watts: int) -> tuple[bool, str]:
+        if self.racks[rack].hall == FLEET_HALL:
+            return self.real_rack_power_limit(rack, watts)
         with self.lock:
             w = max(300, min(DEFAULT_POWER_LIMIT, int(watts)))
             count = 0
@@ -1335,6 +1448,8 @@ class Cluster:
             return True, f"{count} GPUs in rack {rack} are now capped at {w} W."
 
     def drain_node(self, node: str) -> tuple[bool, str]:
+        if self.is_real(node):
+            return self.real_drain(node)
         with self.lock:
             n = self.nodes[node]
             if n.status == "rebooting":
@@ -1344,6 +1459,8 @@ class Cluster:
             return True, f"{node} is drained. Running jobs keep going; nothing new lands here."
 
     def drain_rack(self, rack: str) -> tuple[bool, str]:
+        if self.racks[rack].hall == FLEET_HALL:
+            return self.real_drain_rack(rack)
         with self.lock:
             names = [nm for nm in self.racks[rack].nodes if self.nodes[nm].status == "active"]
             for nm in names:
@@ -1352,6 +1469,8 @@ class Cluster:
             return True, f"Rack {rack} is drained ({len(names)} servers). Running jobs keep going until they are moved."
 
     def undrain_node(self, node: str) -> tuple[bool, str]:
+        if self.is_real(node):
+            return self.real_undrain(node)
         with self.lock:
             n = self.nodes[node]
             if n.status == "rebooting":
@@ -1366,6 +1485,8 @@ class Cluster:
             return True, f"{node} is back in service as a spare."
 
     def restart_job(self, job_id: str) -> tuple[bool, str]:
+        if job_id in self.jobs and self.jobs[job_id].real:
+            return self.real_restart_job(job_id)
         with self.lock:
             job = self.jobs.get(job_id)
             if not job:
@@ -1400,6 +1521,8 @@ class Cluster:
             return True, f"Restarting {job.id} from checkpoint step {job.checkpoint}{where}. {lost} steps redone."
 
     def reset_gpu(self, node: str, gpu: int) -> tuple[bool, str]:
+        if self.is_real(node):
+            return self.real_reset_gpu(node, gpu)
         with self.lock:
             n = self.nodes[node]
             g = n.gpus[gpu]
@@ -1424,6 +1547,8 @@ class Cluster:
             return True, msg
 
     def reboot_node(self, node: str) -> tuple[bool, str]:
+        if self.is_real(node):
+            return self.real_reboot(node)
         with self.lock:
             n = self.nodes[node]
             busy = [j.id for j in self.jobs.values() if node in j.nodes and j.status in ("running", "restarting")]
@@ -1456,6 +1581,12 @@ class Cluster:
             if not t or t["status"] != "open":
                 return False, "No open ticket with that ID."
             t["status"] = "repaired"
+            if (t["node"] and self.is_real(t["node"])) or (not t["node"] and self.racks.get(t["rack"]) is not None
+                                                            and self.racks[t["rack"]].hall == FLEET_HALL):
+                # a real repair: its readings will show whether it worked; nothing here changes them
+                self._log(t["node"] or f"rack-{t['rack']}", "technician", "info",
+                          f"{ticket_id} marked repaired; Nightingale keeps reading the real server to confirm")
+                return True, f"{ticket_id} marked repaired."
             if t["kind"] == "facility":
                 for f in self._unresolved(kind="rack_cooling", rack=t["rack"]):
                     f.status = "resolved"
@@ -1482,7 +1613,10 @@ class Cluster:
             j = self.jobs[job]
             j.owner_notified = True
             self.notifications.append({"job": job, "owner": j.owner, "message": message[:400], "tick": self.tick_count})
-            self._log(j.nodes[0], "nightingale", "info", f"notified {j.owner} about {job}")
+            self._log(j.nodes[0] if j.nodes else "fleet", "nightingale", "info", f"notified {j.owner} about {job}")
+            if j.real:
+                return True, (f"Message recorded for the owners of {job} (namespace {j.owner}). Nightingale has no "
+                              "chat or email connection yet, so pass it on to them.")
             return True, f"Message sent to {j.owner}."
 
     def recommend(self, node: str, message: str) -> tuple[bool, str]:
@@ -1502,10 +1636,11 @@ class Cluster:
         """An independent copy of the whole data center, for dry-running a plan."""
         with self.lock:
             twin = Cluster.__new__(Cluster)
-            state = {k: v for k, v in self.__dict__.items() if k not in ("lock", "rng", "logs", "local", "pc")}
+            state = {k: v for k, v in self.__dict__.items() if k not in ("lock", "rng", "logs", "local", "pc", "fleet")}
             twin.__dict__.update(copy.deepcopy(state))
             twin.local = None  # the copy keeps this computer's last readings, frozen
             twin.pc = None     # and can never run a fix on the real computer
+            twin.fleet = None  # nor touch real servers: their plans are rehearsed with Kubernetes' dry run
             twin.lock = threading.RLock()
             twin.rng = random.Random()
             twin.rng.setstate(self.rng.getstate())
@@ -1576,7 +1711,7 @@ class Cluster:
                 for g in n.gpus:
                     where = f"{n.name} GPU {g.index}"
                     if g.lost:
-                        out.append(f"{where}: down, not visible on the bus"
+                        out.append(f"{where}: " + ("not reporting to DCGM (real server)" if n.real else "down, not visible on the bus")
                                    + (" (known: repair ticket open)" if self.has_open_ticket(n.name) else ""))
                         continue
                     if n.local:
@@ -1584,6 +1719,10 @@ class Cluster:
                             why = ("cutting clocks for heat" if THERMAL_REASONS & set(g.reasons) else
                                    f"{g.temp:.0f}C" if g.temp >= LOCAL_HOT else "memory almost full")
                             out.append(f"{where} (this computer): {why}")
+                        continue
+                    if n.real:
+                        if self.fleet_odd(n, g):
+                            out.append(f"{where} (real server): {self._fleet_why(n, g)}")
                         continue
                     hist = g.history
                     why = []
@@ -1617,6 +1756,9 @@ class Cluster:
                     power += g.power
                     if n.local:
                         watch += self.local_odd(g)
+                        continue
+                    if n.real:
+                        watch += self.fleet_odd(n, g)
                         continue
                     hist = g.history
                     rising = len(hist) >= 3 and (hist[-1][5] > hist[-3][5] or hist[-1][7] > hist[-3][7])
@@ -1653,6 +1795,16 @@ class Cluster:
                                 temps.append(round(g.temp))
                                 codes.append(code)
                                 continue
+                            if n.real:
+                                code = ("x" if g.lost else "w" if self.fleet_odd(n, g) else "d" if n.status == "drained"
+                                        else "b" if g.job or g.util >= 10 else "i")
+                                lost += code == "x"
+                                watch += code == "w"
+                                temps.append(round(g.temp))
+                                codes.append(code)
+                                if (g.job or g.util >= 10) and not g.lost:
+                                    busy.append(g.temp)
+                                continue
                             hist = g.history
                             rising = len(hist) >= 3 and (hist[-1][5] > hist[-3][5] or hist[-1][7] > hist[-3][7])
                             if g.lost:
@@ -1674,12 +1826,14 @@ class Cluster:
                             if g.job and not g.lost:
                                 busy.append(g.temp)
                     out_rack = {"id": rack.id, "temps": temps, "codes": "".join(codes), "lost": lost, "watch": watch,
-                                "avg": round(sum(busy) / len(busy)) if busy else round(sum(temps) / len(temps)),
+                                "avg": round(sum(busy) / len(busy)) if busy else round(sum(temps) / len(temps)) if temps else 0,
                                 "busy": len(busy),
                                 # what a sensor shows, not what the drill did
                                 "cooling": rack.coolant_flow < 90}
                     if rack.hall == LOCAL_HALL:
                         out_rack.update({"local": True, "model": self.nodes[LOCAL_NODE].model, "cooling": False})
+                    if rack.hall == FLEET_HALL:
+                        out_rack.update({"real": True, "cooling": False, "label": rack.cdu, "servers": len(rack.nodes)})
                     racks.append(out_rack)
                 out.append({"hall": hall, "racks": racks})
             return out
@@ -1695,11 +1849,12 @@ class Cluster:
                 n = self.nodes[nm]
                 jobs = sorted({g.job for g in n.gpus if g.job})
                 servers.append({"name": nm, "status": n.status, "jobs": jobs, "local": n.local, "model": n.model,
-                                "ticket": self.has_open_ticket(nm),
+                                "ticket": self.has_open_ticket(nm), "real": n.real, "ready": n.ready,
+                                "driver": n.driver, "kname": n.kname,
                                 "gpus": [self._gpu_public(n, g) for g in n.gpus]})
             return {"id": rid, "hall": rack.hall, "cdu": rack.cdu, "flow": round(rack.coolant_flow),
                     "return_temp": round(rack.coolant_return, 1), "servers": servers,
-                    "local": rack.hall == LOCAL_HALL}
+                    "local": rack.hall == LOCAL_HALL, "real": rack.hall == FLEET_HALL}
 
     def _gpu_public(self, n: Node, g: GPU) -> dict:
         hist = g.history
@@ -1712,7 +1867,11 @@ class Cluster:
                 **({"local": True, "watch": self.local_odd(g), "max_clock": g.max_clock, "power_max": g.power_max,
                     "mem_used": g.mem_used, "mem_total": g.mem_total, "fan": g.fan, "reasons": list(g.reasons),
                     "policy_flags": list(g.policy_flags)}
-                   if n.local else {})}
+                   if n.local else {}),
+                **({"real": True, "watch": self.fleet_odd(n, g), "why": self._fleet_why(n, g), "max_clock": g.max_clock,
+                    "power_min": g.power_min, "power_max": g.power_max, "mem_used": g.mem_used, "mem_total": g.mem_total,
+                    "reasons": list(g.reasons), "xid": g.xid, "xid_at": g.xid_at, "uuid": g.uuid, "pod": g.pod}
+                   if n.real else {})}
 
     def gpu_detail(self, node: str, gpu: int) -> dict | None:
         with self.lock:
@@ -1726,6 +1885,9 @@ class Cluster:
                 snap = self.local.snapshot() if self.local is not None else {"processes": []}
                 extra = {"model": n.model, "driver": n.driver,
                          "processes": [p for p in snap["processes"] if p.get("gpu", 0) == gpu][:8]}
+            elif n.real:
+                extra = {"model": n.model, "driver": n.driver, "ready": n.ready, "kname": n.kname or n.name,
+                         "issues": self.fleet_issues(n)}
             return {"node": nm, "rack": n.rack, "status": n.status, **self._gpu_public(n, g), **extra,
                     "history": [{"tick": h[0], "temp": h[1], "power": h[2], "clock": h[3], "sbe": h[5],
                                  "nvlink_crc": h[7], "lost": h[8], "util": h[9] if len(h) > 9 else 0} for h in g.history],
@@ -1735,10 +1897,13 @@ class Cluster:
         with self.lock:
             return {
                 "tick": self.tick_count, "size": self.size, "sizes": list(SIZES),
-                "servers": len(self.sim_nodes()), "racks": len(self.racks) - (LOCAL_RACK in self.racks), "halls": self.halls,
+                "servers": len(self.sim_nodes()),
+                "racks": sum(1 for r in self.racks.values() if r.hall not in (LOCAL_HALL, FLEET_HALL)), "halls": self.halls,
                 "local": self.local_status(),
+                "real": self.fleet_status(),
                 "gauges": self.gauges(),
-                "jobs": [{"id": j.id, "owner": j.owner, "servers": len(j.nodes), "gpus": len(j.nodes) * 8,
+                "jobs": [{"id": j.id, "owner": j.owner, "servers": len(j.nodes), "gpus": j.gpus if j.real else len(j.nodes) * 8,
+                          "real": j.real,
                           "status": j.status, "step": int(j.step), "checkpoint": j.checkpoint,
                           "rate": round(j.rate, 3), "throughput": int(j.tokens_per_gpu * j.rate),
                           "last_error": j.last_error} for j in self.jobs.values()],

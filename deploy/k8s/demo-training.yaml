@@ -1,0 +1,74 @@
+# A small, real GPU training job for trying Nightingale on a real cluster: it trains, prints its speed,
+# and saves a checkpoint every 500 steps, so it resumes where it left off when Nightingale moves it.
+# The pod failure policy means an eviction (Nightingale moving the job) isn't counted as the job failing.
+apiVersion: v1
+kind: Namespace
+metadata: {name: ml}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: llm-train-code, namespace: ml}
+data:
+  train.py: |
+    import os, time, torch
+    ckpt = os.environ.get("CKPT", "/ckpt/llm-train.pt")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(*[torch.nn.Linear(4096, 4096) for _ in range(8)]).cuda()
+    opt = torch.optim.SGD(model.parameters(), lr=1e-5)
+    step = 0
+    if os.path.exists(ckpt):
+        state = torch.load(ckpt, map_location="cuda")
+        model.load_state_dict(state["model"])
+        step = state["step"]
+        print(f"resumed from checkpoint at step {step} on {os.uname().nodename}", flush=True)
+    x = torch.randn(8192, 4096, device="cuda")
+    t0 = time.time()
+    while True:
+        loss = model(x).pow(2).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        step += 1
+        if step % 50 == 0:
+            torch.cuda.synchronize()
+            dt, t0 = time.time() - t0, time.time()
+            print(f"step {step} loss {loss.item():.5f} {50 / dt:.1f} steps/s", flush=True)
+        if step % 500 == 0:
+            torch.save({"model": model.state_dict(), "step": step}, ckpt + ".tmp")
+            os.replace(ckpt + ".tmp", ckpt)
+            print(f"checkpoint saved at step {step}", flush=True)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-train
+  namespace: ml
+spec:
+  backoffLimit: 6
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions: [{type: DisruptionTarget}]
+  template:
+    metadata:
+      labels: {app: llm-train}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: train
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          # through sh, so a drill can kill the training process (PID 1 itself can't be killed from inside)
+          command: ["sh", "-c", "python -u /app/train.py"]
+          env: [{name: CKPT, value: /ckpt/llm-train.pt}]
+          resources:
+            limits: {nvidia.com/gpu: 1}
+          volumeMounts:
+            - {name: code, mountPath: /app}
+            - {name: ckpt, mountPath: /ckpt}
+      volumes:
+        - name: code
+          configMap: {name: llm-train-code}
+        - name: ckpt
+          hostPath: {path: /var/lib/nightingale-demo, type: DirectoryOrCreate}

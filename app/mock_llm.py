@@ -21,15 +21,29 @@ TARGET_RE = re.compile(r"\b(dgx-\d{4}|[A-H]-\d{2}|laptop)\b")
 LOCAL_RE = re.compile(r"^\s+(laptop) \[this computer\] g(\d+) .+? temp=(\d+)C power=\d+W/\d+W "
                       r"clock=(\d+)/(\d+)MHz util=(\d+)% vram=(\d+)/(\d+)MiB throttle=(\S+)")
 LOCAL_LOST_RE = re.compile(r"^\s+(laptop) \[this computer\] g(\d+) LOST")
+REAL_LINE_RE = re.compile(r"Real servers \(.*?\): \d+ servers, \d+ GPUs: (.*?); cordoned: (.*?); NotReady: (.*?); "
+                          r"not reporting: (.*?)\. ")
+REAL_ROW_RE = re.compile(r"^\s+(\S+) \[real server, rack (R-\d+), (\w+)(, NotReady)?\] g(\d+) (.*)$")
+REAL_VALS_RE = re.compile(r"temp=(\d+)C .*?util=(\d+)% throttle=(\S+) sbe=(\d+)\(\+(\d+)\) dbe=(\d+)\(\+(\d+)\) "
+                          r"nvlink_crc=(\d+)\(\+(\d+)\) remap_pending=(yes|no) xid=(none|\d+)")
+
+
+def _names(text: str) -> set:
+    return {x.strip() for x in re.sub(r" and \d+ more", "", text).split(",") if x.strip() and x.strip() != "none"}
 
 
 # --------------------------------------------------------------------------- triage
 def triage(digest: str) -> dict:
     skip = set()
+    real: set = set()
+    rm = REAL_LINE_RE.search(digest)
+    if rm:
+        real = _names(rm.group(1))
     for label in ("Known issues already handled", "Open incidents"):
         m = re.search(label + r"[^:]*: (.*)", digest)
         if m:
             skip |= set(TARGET_RE.findall(m.group(1)))
+            skip |= {n for n in real if re.search(r"(^|[\s(,])" + re.escape(n) + r"([\s(,]|$)", m.group(1))}
     hot_racks = {}
     for rid, avg, fleet in RACK_RE.findall(digest):
         hot_racks[rid] = int(avg) - int(fleet)
@@ -50,8 +64,38 @@ def triage(digest: str) -> dict:
         if rid not in skip:
             add(rid, None, "incident" if gap >= 8 else "watch", "Rack running hotter than the fleet",
                 f"rack {rid} busy GPUs {gap}C above the fleet average")
+    if rm:
+        for n in _names(rm.group(3)):
+            add(n, None, "incident", "Kubernetes node is NotReady", f"{n} NotReady")
     rack_of: dict[str, str] = {}
     for line in digest.splitlines():
+        m = REAL_ROW_RE.match(line)
+        if m:
+            node, _rack, _st, _nr, g, rest = m.groups()
+            g = int(g)
+            if rest.startswith("NOT REPORTING"):
+                add(node, g, "incident", "A real GPU stopped reporting to DCGM", line)
+                continue
+            v = REAL_VALS_RE.search(rest)
+            if not v:
+                continue
+            temp, util, thr, _sbe, dsbe, dbe, ddbe, _nvl, dnvl, remap, xid = v.groups()
+            temp, util, dsbe, ddbe, dnvl = int(temp), int(util), int(dsbe), int(ddbe), int(dnvl)
+            if xid != "none":
+                add(node, g, "incident", f"Driver reported Xid {xid} on a real GPU", line)
+            elif ddbe > 0 or int(dbe) > 0:
+                add(node, g, "incident", "Uncorrectable (double-bit) ECC error", line)
+            elif remap == "yes":
+                add(node, g, "incident", "Pending memory row remap", line)
+            elif dnvl > 0:
+                add(node, g, "incident", "NVLink error counter is climbing", line)
+            elif "HW_THERMAL" in thr or ("THERMAL" in thr and util >= 30):
+                add(node, g, "incident", "Real GPU slowing down for heat under load", line)
+            elif dsbe >= 10:
+                add(node, g, "watch", "Single-bit ECC errors climbing fast", line)
+            elif temp >= 83:
+                add(node, g, "watch", "Real GPU temperature trending high", line)
+            continue
         m = LOCAL_LOST_RE.match(line)
         if m:
             add("laptop", int(m.group(2)), "incident", "This computer's GPU stopped answering the driver", line)
@@ -99,6 +143,19 @@ def triage(digest: str) -> dict:
         if not m:
             continue
         where, src, text = m.groups()
+        if where in real:
+            xid = XID_RE.search(text)
+            if xid:
+                add(where, None, "incident", f"Driver reported Xid {xid.group(2)} on a real GPU", line)
+            elif "stopped reporting" in text:
+                add(where, None, "incident", "A real GPU stopped reporting to DCGM", line)
+            elif "NotReady" in text:
+                add(where, None, "incident", "Kubernetes node is NotReady", line)
+            elif src == "kubernetes" and re.search(r"restarted|CrashLoopBackOff|is now crashed|is Failed|OOMKill", text):
+                add(where, None, "incident", "A GPU workload is crashing", line)
+            elif "double-bit" in text or "row remap" in text:
+                add(where, None, "incident", "Memory errors on a real GPU", line)
+            continue
         if where == "laptop":
             if src == "windows":
                 add("laptop", None, "incident", "The display driver on this computer reported errors", line)
@@ -152,6 +209,8 @@ def _classify(cluster, target: str, gpu, signal: str = ""):
     node = cluster.nodes[target]
     if node.local:
         return _classify_local(cluster, node, gpu, signal)
+    if node.real:
+        return _classify_real(cluster, node, gpu, signal)
     logs = [l["text"] for l in cluster.logs if l["node"] == target][-80:]
     joined = "\n".join(logs)
     lost = [g for g in node.gpus if g.lost]
@@ -179,8 +238,87 @@ def _classify(cluster, target: str, gpu, signal: str = ""):
     return "unknown", gpu if gpu is not None else 0
 
 
+XID_KIND = {"gpu_lost": "real_lost", "memory": "real_memory", "interconnect": "real_nvlink",
+            "firmware": "real_firmware", "software": "real_app"}
+
+
+def _classify_real(cluster, node, gpu, signal: str):
+    import time  # noqa: PLC0415
+
+    from .dcgm import XID  # noqa: PLC0415
+    lost = [g for g in node.gpus if g.lost]
+    if lost:
+        return "real_lost", lost[0].index
+    recent = [g for g in node.gpus if g.xid_at and time.time() - g.xid_at < 300]
+    if recent:
+        g = max(recent, key=lambda x: x.xid_at)
+        return XID_KIND.get(XID.get(g.xid, ("", "software"))[1], "real_app"), g.index
+    for g in node.gpus:
+        h = list(g.history)
+        if g.dbe or g.remap_pending or (len(h) >= 3 and h[-1][5] > h[-3][5]):
+            return "real_memory", g.index
+    for g in node.gpus:
+        h = list(g.history)
+        if len(h) >= 3 and h[-1][7] > h[-3][7]:
+            return "real_nvlink", g.index
+    if not node.ready:
+        return "real_notready", gpu if gpu is not None else 0
+    if any(j.real and node.name in j.nodes and j.status == "crashed" for j in cluster.jobs.values()) or "crash" in signal:
+        return "real_crash", gpu if gpu is not None else 0
+    hot = max(node.gpus, key=lambda x: x.temp) if node.gpus else None
+    if hot is not None and (hot.temp >= 80 or "HW_THERMAL_SLOWDOWN" in hot.reasons
+                            or (any("THERMAL" in r for r in hot.reasons) and hot.util >= 30)):
+        return "real_thermal", hot.index
+    return "real_unknown", gpu if gpu is not None else 0
+
+
+def _plan_real(kind: str, n: str, g, job: str | None) -> list[tuple]:
+    steps = [(f"Read every GPU on real server {n} as DCGM reports it now.", "node_status", {"node": n})]
+    if kind == "real_lost":
+        steps += [("Find what DCGM and Kubernetes logged when the GPU went quiet.", "search_logs", {"query": "", "node": n})]
+        if job:
+            steps += [(f"See what this did to {job}.", "job_info", {"job": job})]
+        steps += [(f"Check fleet memory: has {n} lost a GPU before?", "incident_history", {"target": n}),
+                  ("See where Kubernetes could run the work instead.", "find_spares", {"count": 1, "avoid_rack": n})]
+    elif kind == "real_memory":
+        steps += [("Find the memory errors DCGM reported.", "search_logs", {"query": "ECC", "node": n}),
+                  (f"See how GPU {g}'s error counters moved.", "gpu_history", {"node": n, "gpu": g}),
+                  (f"Check fleet memory for earlier trouble on {n}.", "incident_history", {"target": n})]
+        if job:
+            steps += [("See what runs on the GPU before planning a reset.", "job_info", {"job": job})]
+    elif kind in ("real_nvlink", "real_firmware"):
+        steps += [("Find the driver messages.", "search_logs", {"query": "Xid" if kind == "real_firmware" else "NVLink", "node": n}),
+                  (f"See how GPU {g} has behaved.", "gpu_history", {"node": n, "gpu": g}),
+                  (f"Check fleet memory for earlier trouble on {n}.", "incident_history", {"target": n})]
+        if job:
+            steps += [("See which workload depends on it.", "job_info", {"job": job})]
+    elif kind == "real_app":
+        steps += [("Find the Xid and what ran at the time.", "search_logs", {"query": "Xid", "node": n})]
+        if job:
+            steps += [(f"Check {job}'s pods and last error.", "job_info", {"job": job})]
+        steps += [(f"See whether GPU {g}'s telemetry looks healthy.", "gpu_history", {"node": n, "gpu": g})]
+    elif kind == "real_crash":
+        if job:
+            steps += [(f"Read {job}'s pods, restarts and last error.", "job_info", {"job": job})]
+        steps += [("Find the crash in the Kubernetes log lines.", "search_logs", {"query": "pod", "node": n}),
+                  (f"Rule out the hardware: how did GPU {g} behave?", "gpu_history", {"node": n, "gpu": g})]
+    elif kind == "real_thermal":
+        steps += [(f"See how GPU {g}'s temperature and clocks moved.", "gpu_history", {"node": n, "gpu": g}),
+                  ("Compare with the other real servers.", "compare_rack", {"rack": n}),
+                  ("Look for slowdown messages.", "search_logs", {"query": "clocks reduced", "node": n})]
+    elif kind == "real_notready":
+        steps += [("Find what Kubernetes said about the node.", "search_logs", {"query": "Ready", "node": n})]
+        if job:
+            steps += [(f"See what this does to {job}.", "job_info", {"job": job})]
+    else:
+        steps += [("Look for recent warnings and errors.", "search_logs", {"query": "", "node": n})]
+    return steps
+
+
 def _plan(kind: str, target: str, g, job: str | None, rack: str) -> list[tuple]:
     n = target
+    if kind.startswith("real_"):
+        return _plan_real(kind, n, g, job)
     if kind == "local_thermal":
         return [("Read every value the GPU reports right now, including why it is slowing down.", "node_status", {"node": n}),
                 (f"See how GPU {g}'s temperature, clocks and load moved over the last half minute.", "gpu_history", {"node": n, "gpu": g}),
@@ -430,10 +568,125 @@ def _final_local(kind, n, g, steps, cluster) -> dict:
             "root_cause": "Not enough evidence.", "evidence": [], "actions": []}
 
 
+def _final_real(kind, n, g, job, steps, cluster, revise=None) -> dict:
+    from .dcgm import xid_text  # noqa: PLC0415
+    node = cluster.nodes[n]
+    gpu = node.gpus[g if g is not None and g < len(node.gpus) else 0]
+    gt = f"GPU {gpu.index}"
+    hist_m = _from_steps(steps, "incident_history", r"(\d+) incidents on")
+    prior = int(hist_m.group(1)) if hist_m else 0
+    j = cluster.jobs.get(job) if job else None
+    xid = xid_text(gpu.xid) if gpu.xid else ""
+    base = {"needs_technician": False, "technician_note": "", "scope": "gpu",
+            "affected": {"target": n, "gpus": [gpu.index], "jobs": [job] if job else []}}
+
+    def act(name, why, **params):
+        return {"action": name, "params": params, "reason": why}
+
+    move = ([act("restart_job_from_checkpoint", f"Evict {job}'s pods so Kubernetes starts them on a healthy "
+                 "server; the job resumes from its own checkpoint.", job=job)] if j and j.status != "crashed" else [])
+    drain = act("drain_node", f"Cordon {n} so Kubernetes places no new work on it.", node=n)
+    ev = _evidence_lines(steps, [r"Xid", r"NOT REPORTING", r"stopped reporting", r"dbe=[1-9]", r"remap_pending=yes",
+                                 r"NotReady", r"restarted|CrashLoopBackOff|crashed", r"HW_THERMAL|clocks reduced"])
+    if kind == "real_lost":
+        gone = gpu.lost
+        d = {**base, "title": (f"{gt} on {n} stopped reporting to DCGM" if gone else
+                               f"{gt} on {n} fell off the bus (Xid {gpu.xid})"),
+             "category": "gpu_lost", "severity": "critical", "confidence": 0.86,
+             "summary": ((f"{gt} on real server {n} no longer answers DCGM" + (f" after {xid}" if gpu.xid_at else "") + ". ")
+                         if gone else
+                         (f"DCGM reported {xid} on {gt} of real server {n}. A GPU that has dropped off the bus can't be "
+                          "trusted until the server is rebooted or the GPU reseated, even if it answers again. ")) +
+                        "Cordon the server, move " + (f"{job}" if j else "its work") +
+                        " off it, and have the server rebooted or the GPU reseated.",
+             "root_cause": f"{gt} on {n} dropped off the bus or its driver lost it.",
+             "evidence": ev, "needs_technician": True,
+             "technician_note": f"Reboot {n} through its BMC or cloud console; reseat or replace {gt} if it happens again.",
+             "actions": [drain] + move + [act("open_ticket", "A reboot or reseat needs hands on the server.", node=n,
+                                              gpu=gpu.index, summary=(f"{gt} stopped reporting on {n}" if gone else
+                                                                      f"{gt} on {n}: {xid}")
+                                              + "; reboot the server, reseat the GPU if it happens again")]}
+    elif kind in ("real_memory", "real_nvlink", "real_firmware"):
+        what = {"real_memory": "memory errors", "real_nvlink": "NVLink errors", "real_firmware": "a firmware (GSP) error"}[kind]
+        tech = kind == "real_nvlink" or gpu.dbe > 0 or prior >= 1
+        acts = [drain] + move + [act("reset_gpu", "With the work moved, a reset clears the error state"
+                                     + (" and applies the pending row remap." if gpu.remap_pending else "."), node=n, gpu=gpu.index)]
+        acts.append(act("open_ticket", "It keeps happening or the link is physical; replace or inspect the part.",
+                        node=n, gpu=gpu.index, summary=f"{gt} on {n}: {what}" + (f" ({xid})" if xid else ""))
+                    if tech else act("undrain_node", "Return the server once the reset is clean.", node=n))
+        d = {**base, "title": f"{gt} on {n}: {what}", "category": "interconnect" if kind == "real_nvlink" else "memory"
+             if kind == "real_memory" else "unknown", "severity": "high", "confidence": 0.8,
+             "summary": (f"DCGM shows {what} on {gt} of real server {n}" + (f" ({xid})" if gpu.xid_at else "") +
+                         ". Running work there risks a crash or wrong results. Cordon the server, move "
+                         + (job if j else "its work") + ", then reset the GPU" + (" and send it for repair." if tech else ".")),
+             "root_cause": f"{what.capitalize()} on {gt} of {n}.", "evidence": ev, "needs_technician": tech,
+             "technician_note": f"Inspect or replace {gt} on {n}." if tech else "", "actions": acts}
+    elif kind == "real_app":
+        d = {**base, "title": f"{job or 'A workload'} hit {xid or 'a driver error'} on {n}", "category": "software",
+             "scope": "job", "severity": "medium", "confidence": 0.75,
+             "summary": (f"{xid or 'The Xid'} on {gt} of {n} usually comes from the program on the GPU, not the "
+                         "hardware, and the GPU's telemetry looks healthy. Tell the workload's owners; moving it "
+                         "would hit the same error."),
+             "root_cause": "An error in the workload's own code or framework.", "evidence": ev,
+             "actions": [act("notify_owner", "The error comes from their code.", job=job,
+                             message=f"{job} hit {xid or 'a GPU driver error'} on {n} {gt}; telemetry is healthy, "
+                                     "so please check the code or framework before restarting.")] if j else []}
+    elif kind == "real_crash":
+        err = j.last_error if j else ""
+        oom = "OOMKilled" in err
+        d = {**base, "title": f"{job or 'A GPU workload'} keeps crashing on {n}", "category": "software", "scope": "job",
+             "severity": "medium", "confidence": 0.72,
+             "summary": (f"{job or 'The workload'}'s pods on {n} are restarting ({err or 'see the pod logs'}). The GPUs "
+                         "report no hardware errors, so the cause is in the workload" +
+                         (": it ran out of memory." if oom else ".") + " Tell its owners."),
+             "root_cause": "The workload runs out of memory." if oom else "The workload's own code or settings fail.",
+             "evidence": ev,
+             "actions": [act("notify_owner", "The crash comes from the workload itself.", job=job,
+                             message=f"{job} keeps crashing on {n}: {err or 'see its pod logs'}. GPUs are healthy.")] if j else []}
+    elif kind == "real_thermal":
+        lim = gpu.power_limit or 0
+        cap = max(gpu.power_min or 0, int(round(lim * 0.85 / 5) * 5)) if lim else 0
+        acts = ([act("set_power_limit", "Less power means less heat, so it stops throttling while cooling is checked.",
+                     node=n, gpu=gpu.index, watts=cap)] if cap else [])
+        acts.append(act("open_ticket", "The cooling of this GPU needs a physical check.", node=n, gpu=gpu.index,
+                        summary=f"{gt} on {n} slowing down for heat at {gpu.temp:.0f}C under load; check airflow and fans"))
+        d = {**base, "title": f"{gt} on {n} is slowing down for heat", "category": "thermal", "severity": "high",
+             "confidence": 0.78,
+             "summary": (f"{gt} on real server {n} is at {gpu.temp:.0f}C and cutting its clocks under load "
+                         f"({'+'.join(gpu.reasons) or 'thermal'}). Cap its power a little to stop the throttling and "
+                         "have its cooling checked."),
+             "root_cause": f"Not enough cooling for {gt} on {n} at this load.", "evidence": ev, "needs_technician": True,
+             "technician_note": f"Check airflow, fans and heatsink contact for {gt} on {n}.", "actions": acts}
+    elif kind == "real_notready":
+        d = {**base, "title": f"Kubernetes node {n} is NotReady", "category": "unknown", "scope": "server",
+             "severity": "high", "confidence": 0.7,
+             "summary": (f"Kubernetes reports {n} NotReady ({node.ready_reason or 'no reason given'}), so its pods can't "
+                         "be managed. Cordon it, move " + (job if j else "its work") + ", and have the server checked."),
+             "root_cause": f"The kubelet on {n} stopped reporting or the node is unhealthy.", "evidence": ev,
+             "needs_technician": True, "technician_note": f"Check {n}: kubelet, network and power.",
+             "actions": [drain] + move + [act("open_ticket", "The server needs someone to look at it.", node=n,
+                                              gpu=None, summary=f"{n} NotReady: {node.ready_reason or 'unknown'}")]}
+    else:
+        d = {**base, "title": f"Unclear problem on {n}", "category": "unknown", "scope": "server", "severity": "low",
+             "confidence": 0.3, "summary": "Something looked off on this real server, but the data does not point to a cause yet.",
+             "root_cause": "Not enough evidence.", "evidence": ev, "actions": []}
+    if revise is not None:  # keep the steps the rehearsal accepted, and always the ticket
+        ok = [s["ok"] for s in revise.get("steps", [])]
+        d["actions"] = [a for i, a in enumerate(d["actions"])
+                        if (i < len(ok) and ok[i]) or a["action"] in ("open_ticket", "notify_owner")]
+        if not any(a["action"] == "open_ticket" for a in d["actions"]):
+            d["actions"].append(act("open_ticket", "The rehearsal showed Nightingale can't act here; hand it over.",
+                                    node=n, gpu=gpu.index, summary=f"{d['title']}: needs a person"))
+        d["summary"] += " (Revised after the rehearsal: only the steps Kubernetes accepted are left.)"
+    return d
+
+
 def _final(kind, target, g, job, rack, steps, cluster, revise=None) -> dict:
     n = target
     if kind.startswith("local_"):
         return _final_local(kind, n, g, steps, cluster)
+    if kind.startswith("real_"):
+        return _final_real(kind, n, g, job, steps, cluster, revise)
     spare_m = _from_steps(steps, "find_spares", r"first \d+: (dgx-\d+)")
     spare = spare_m.group(1) if spare_m else "a spare"
     hist_m = _from_steps(steps, "incident_history", r"(\d+) incidents on")

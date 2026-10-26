@@ -80,10 +80,25 @@ LABELS = {
 }
 
 
+REAL_LABELS = {
+    "drain_node": "Cordon {node}",
+    "drain_rack": "Cordon every server in rack {rack}",
+    "undrain_node": "Uncordon {node}",
+    "restart_job_from_checkpoint": "Move {job}: evict its pods so it restarts on a healthy server",
+}
+
+
 def catalog_text() -> str:
     dc = "\n".join(f"- {name}({', '.join(spec['params'])}): {spec['desc']}" for name, spec in CATALOG.items()
                    if name != "recommend")
-    return (f"For data center servers and racks:\n{dc}\n\nFor server 'laptop' (this computer) only:\n"
+    return (f"For data center servers and racks:\n{dc}\n\nOn REAL servers (hall R, Kubernetes) the same actions act on "
+            "real infrastructure: drain_node and drain_rack cordon nodes, undrain_node uncordons, "
+            "restart_job_from_checkpoint evicts the job's pods so their controller starts them again on healthy "
+            "nodes, set_power_limit and set_rack_power_limit run nvidia-smi -pl (watts within the GPU's own allowed "
+            "range, shown by node_status), reset_gpu runs nvidia-smi -r. reboot_node is not available for real "
+            "servers: drain, move the job, then open_ticket. Each plan is rehearsed with Kubernetes' server-side "
+            "dry run first."
+            f"\n\nFor server 'laptop' (this computer) only:\n"
             f"- recommend(node, message): {CATALOG['recommend']['desc']}\n{pc_actions.catalog_text()}")
 
 
@@ -145,14 +160,17 @@ def normalize(raw, cluster=None) -> tuple[dict | None, str | None]:
             if value is None or not str(value).strip():
                 return None, f"{name}: missing '{key}'"
             params[key] = str(value).strip()
-    if "watts" in params and not 300 <= params["watts"] <= 700:
-        return None, f"{name}: watts must be between 300 and 700"
     if name == "recommend":
         params["message"] = params["message"][:220]
     if cluster is not None:
         error = cluster.validate_target(params)
         if error:
             return None, f"{name}: {error}"
+    real = cluster is not None and _is_real_target(cluster, params)
+    # Simulated H100s take 300-700 W; a real GPU's own limits are checked when the step is rehearsed.
+    if "watts" in params and not (50 <= params["watts"] <= 1500 if real else 300 <= params["watts"] <= 700):
+        return None, f"{name}: watts must be between {'50 and 1500' if real else '300 and 700'}"
+    if cluster is not None:
         node = cluster.nodes.get(params.get("node"))
         local = bool(node is not None and node.local)
         if local and name != "recommend":
@@ -160,9 +178,14 @@ def normalize(raw, cluster=None) -> tuple[dict | None, str | None]:
                           "instead of data center actions")
         if name == "recommend" and not local:
             return None, "recommend: only for this computer ('laptop'); use the data center actions elsewhere"
+        if name == "reboot_node" and real:
+            return None, ("reboot_node: Nightingale doesn't reboot real servers; drain it, move its jobs and "
+                          "open_ticket for the reboot")
     action = {"action": name, "params": params, "risk": spec["risk"],
               "reason": str(raw.get("reason", "")).strip()[:300], "status": "pending", "result": ""}
     action["label"] = label(action)
+    if real and name in REAL_LABELS:  # say what it does on a real cluster
+        action["label"] = REAL_LABELS[name].format(**{k: params.get(k, "?") for k in ("node", "rack", "job")})
     return action, None
 
 
@@ -200,6 +223,19 @@ def execute(action: dict, cluster) -> tuple[bool, str]:
     return False, f"Unknown action {name}"
 
 
+def _is_real_target(cluster, params: dict) -> bool:
+    if params.get("node") in cluster.nodes:
+        return bool(cluster.nodes[params["node"]].real)
+    if params.get("rack") in cluster.racks:
+        return cluster.racks[params["rack"]].hall == "R"
+    job = cluster.jobs.get(params.get("job")) if params.get("job") else None
+    return bool(job is not None and job.real)
+
+
+def is_real(action: dict, cluster) -> bool:
+    return _is_real_target(cluster, action.get("params", {}))
+
+
 def is_pc(action: dict) -> bool:
     return action["action"] in PC_CATALOG or action["action"] == "recommend"
 
@@ -234,6 +270,10 @@ def dry_run(cluster, plan: list[dict], target: str, settle_ticks: int = 12, mode
     """Run a plan on a copy of the data center and report what would happen (or, for this computer, check it)."""
     if plan and all(is_pc(a) for a in plan):
         return precheck_plan(cluster, plan, target, mode)
+    if plan and getattr(cluster, "fleet", None) is not None and (
+            cluster.is_real(target) or (target in cluster.racks and cluster.racks[target].hall == "R")
+            or any(is_real(a, cluster) for a in plan)):
+        return cluster.rehearse_real(plan, target)  # real servers can't be copied: Kubernetes dry run instead
     twin = cluster.clone()
     jobs_here = twin.jobs_on(target)
     before = {j.id: j.status for j in twin.jobs.values()}

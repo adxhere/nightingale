@@ -6,7 +6,7 @@ Nightingale reads the telemetry and logs from every GPU in a data center. NVIDIA
 
 > Monitoring tells you something broke. Nightingale tells you why, proves the fix works, and then fixes it.
 
-**Status:** on your own computer it is real today. It reads your NVIDIA GPU through `nvidia-smi` and Windows' driver error logs, and applies real fixes after you approve them. The data center side runs on a realistic simulator (DCGM-style telemetry, Xid messages, coolant loops, training jobs). A connector for real fleets through a DCGM exporter, Prometheus and Kubernetes is the next step.
+**Three sources, one agent.** Nightingale reads real GPU servers through NVIDIA DCGM (from dcgm-exporter or Prometheus) and Kubernetes, and acts on them through Kubernetes after you approve. It reads your own computer's NVIDIA GPU through `nvidia-smi` and Windows' driver error logs, and fixes it with your approval. It also runs a realistic simulated data center of 256 to 4,096 GPUs for failure drills at a scale no one can rent for a demo. Real servers are always marked "Real", and nothing about them is simulated.
 
 Hackathon track: **Best Apps and Agents** (Nebius x NVIDIA Global AI Hackathon)
 
@@ -77,9 +77,13 @@ flowchart LR
     H -- still broken --> B
 ```
 
-For the demo, the data center is a simulator. Each hall holds 16 racks, each rack 8 DGX-style servers, and each server 8 H100 GPUs. Every rack has its own coolant loop. The simulator produces DCGM-style telemetry, kernel NVRM Xid messages, nvidia-smi errors, coolant sensor readings and PyTorch/NCCL training logs. The models see only those logs, metrics and tool answers, never the simulator's internal state. In a real deployment, a DCGM exporter and syslog feed replace the simulator. Scheduler (Slurm, Kubernetes) and BMC calls replace the actions.
+Three kinds of servers share the same pipeline:
 
-Real data already flows in from one place: the NVIDIA GPU in the computer running Nightingale (`app/local_gpu.py`). It shows up as one more server, `laptop`, in its own hall. Triage, the investigation tools and verification all treat it like any other server. Its fix plans contain only suggestions for you, because Nightingale never changes settings on a personal computer.
+- **Real GPU servers** (hall R, `app/dcgm.py`, `app/kube.py`, `app/fleet.py`, `app/fleet_sync.py`). DCGM readings come from dcgm-exporter or Prometheus, and nodes, GPU workloads and Warning events come from Kubernetes. Approved steps act on the real cluster: cordon a node, evict a job's pods so their controller restarts them elsewhere, or run `nvidia-smi` on the node. A real cluster can't be copied, so instead of the copy each plan is rehearsed with Kubernetes' server-side dry run.
+- **This computer** (hall L, `app/local_gpu.py`, `app/pc_actions.py`). Your own NVIDIA GPU, with fixes for a Windows PC in light and serious mode.
+- **The simulated data center** (halls A to H, `app/simulator.py`). Each hall holds 16 racks, each rack 8 DGX-style servers, and each server 8 H100 GPUs, and every rack has its own coolant loop. It produces DCGM-style telemetry, kernel NVRM Xid messages, coolant sensor readings and PyTorch/NCCL training logs for failure drills. The models see only those logs, metrics and tool answers, never the simulator's internal state.
+
+Triage, the investigation tools, rehearsal and verification treat all three the same way. Only what an approved step does differs.
 
 ## The dashboard
 
@@ -91,7 +95,7 @@ Real data already flows in from one place: the NVIDIA GPU in the computer runnin
 | **Logs** | The live log stream with filters; lines used as evidence are marked; paste your own logs for a diagnosis |
 | **Ask** | Questions about the data center, answered by Nemotron from live data, with the tool calls it made |
 | **Benchmark** | Runs 6, 12 or 30 failure drills and scores Nightingale end to end; download the results as JSON |
-| **Data sources** | Connect this computer's GPU; set the simulated data center's size (256, 1,024, 2,048 or 4,096 GPUs); run failure drills |
+| **Data sources** | Connect real GPU servers (a dcgm-exporter or Prometheus URL, plus Kubernetes) and this computer's GPU; set the simulated data center's size (256, 1,024, 2,048 or 4,096 GPUs); run failure drills |
 
 ## Quick start (demo mode, no API key needed)
 
@@ -135,6 +139,34 @@ Without a key, Nightingale uses an offline stand-in for the models, so you can e
    If they differ from the defaults, put the Nano ID in `TRIAGE_MODEL` and the Ultra ID in `DIAGNOSIS_MODEL`. Nemotron 3 Super works as a fallback for either role.
 4. Start the app again. The top bar now says it is live on Nebius Token Factory.
 
+## Real GPU servers (DCGM and Kubernetes)
+
+Point Nightingale at where your servers' DCGM readings are, in `.env` or on the **Data sources** screen:
+
+| `FLEET_DCGM=` | Reads |
+|---|---|
+| `auto` | Every dcgm-exporter pod in the Kubernetes cluster (NVIDIA GPU Operator or the dcgm-exporter chart) |
+| `http://prometheus:9090` | The latest value of every `DCGM_FI_*` series from a Prometheus that already scrapes dcgm-exporter |
+| `http://10.0.0.5:9400/metrics,...` | One or more dcgm-exporter endpoints directly (`name=url` sets a server's name) |
+
+With a kubeconfig (`FLEET_KUBECONFIG`, `KUBECONFIG`, `~/.kube/config`, or the pod's service account in the cluster), Nightingale also reads nodes, GPU workloads and Warning events. Approved plans can then act:
+
+| Step in a plan | On a real server |
+|---|---|
+| `drain_node`, `drain_rack` | Cordon the node(s): no new work lands there, and running pods keep going |
+| `restart_job_from_checkpoint` | Evict the job's pods so their controller (Job, training operator, Deployment) starts them again on healthy nodes; PodDisruptionBudgets are respected |
+| `set_power_limit`, `reset_gpu` | Run `nvidia-smi -pl` or `nvidia-smi -r` on the node in a short-lived helper pod, within the GPU's own allowed range |
+| `undrain_node` | Uncordon, only when no ticket is open and the server shows no problems |
+| `reboot_node` | Never: Nightingale drains the server and opens a ticket for the reboot |
+
+Every plan is rehearsed with Kubernetes' server-side dry run first, so a missing permission, a PodDisruptionBudget or a GPU still in use shows up before anyone approves. Without Kubernetes, Nightingale watches and opens tickets only. `deploy/k8s/nightingale-rbac.yaml` gives it exactly these permissions and nothing else.
+
+Nightingale reads Xid errors (only ones it saw happen count as current), ECC errors, pending row remaps, NVLink errors, heat slowdown under load, GPUs that stop reporting, NotReady nodes and crashing GPU workloads. `deploy/k8s/dcgm-metrics.csv` is a dcgm-exporter metrics list with the health fields beyond the defaults (ECC, clock-event reasons, power limits, row remapping).
+
+**Try it for free on your own computer.** Run `python -m app.dcgm_bridge`. It serves your NVIDIA GPU in DCGM's exact format at `http://127.0.0.1:9400/metrics`. Paste that URL into Data sources with Kubernetes off, and your computer joins as one real server, read the way a data center is read.
+
+**Try it on a rented NVIDIA GPU.** `deploy/nebius/setup.sh` turns one Nebius AI Cloud GPU VM into a small real cluster: k3s, NVIDIA's GPU Operator with DCGM, a training job that saves checkpoints, and Nightingale connected with `FLEET_DCGM=auto`. `deploy/nebius/faults.sh` then causes real failures (a buggy job that triggers a real Xid, a killed training process) and DCGM-injected ones (Xid 79, 48, 94, 74). See [deploy/nebius/README.md](deploy/nebius/README.md).
+
 ## Failure drills
 
 | Drill | What shows up | What a good fix looks like |
@@ -157,6 +189,7 @@ A restarted job hits the same problem again if the cause is still there, so a wr
 - Each operation checks its own preconditions. You can't reset a GPU or reboot a server while a job runs on it.
 - Repaired servers come back drained and only return to service when someone approves it.
 - The UI treats model output as untrusted text and escapes all of it.
+- On real servers: every plan is rehearsed with Kubernetes' server-side dry run, which changes nothing. Approved steps can only cordon, uncordon, evict a job's pods or run `nvidia-smi -pl` / `-r` on a node. A pod with no controller is never evicted, because it wouldn't come back. A GPU is never reset while a workload uses it. Nightingale never reboots a real server. A copy of the simulator used for a rehearsal can never reach the real servers.
 - On your own computer (`app/pc_actions.py`):
   - Fixes are validated before they're shown: a program can only be closed if `nvidia-smi` lists it on the GPU, and Windows' own processes (explorer, dwm, svchost and others) can never be closed. Clock caps must sit inside the GPU's own range.
   - Before running, each step is checked without changing anything (is the program still running, is that power plan available, does Windows see the GPU). This replaces the rehearsal, because a real computer can't be copied.
@@ -227,6 +260,16 @@ All settings are environment variables (see `.env.example`):
 | `TRIAGE_EVERY_TICKS` | `5` | Scan window length |
 | `SEED` | empty | Fix the random seed for repeatable demos |
 | `AUTO_APPROVE_LOW_RISK` | `false` | Run low-risk steps without a click |
+| `FLEET_DCGM` | empty | Real GPU servers' DCGM readings: `auto`, a Prometheus URL, or dcgm-exporter `/metrics` URLs |
+| `FLEET_KUBE` | `auto` | Kubernetes for real servers: `auto` (use it if a kubeconfig works), `on` (required) or `off` (watch only) |
+| `FLEET_KUBECONFIG` | empty | Kubeconfig file; else `KUBECONFIG`, `~/.kube/config` or the in-cluster service account |
+| `FLEET_KUBE_CONTEXT` | empty | Kubeconfig context to use |
+| `FLEET_POLL_SECONDS` | `5` | How often to read the real servers |
+| `FLEET_NAMESPACE` | `nightingale` | Namespace for the short-lived `nvidia-smi` helper pods |
+| `FLEET_TOOLS_IMAGE` | `nvcr.io/nvidia/cuda:12.6.3-base-ubuntu22.04` | Image for the helper pods (any image works; the NVIDIA runtime provides `nvidia-smi`) |
+| `FLEET_RUNTIME_CLASS` | `nvidia` | RuntimeClass for the helper pods (empty: the cluster's default runtime) |
+| `FLEET_RACK_LABEL` | `nightingale.io/rack` | Node label that groups real servers into racks |
+| `FLEET_UI_CONNECT` | `true` (`false` with `DEMO_PC`) | Allow connecting real servers from the dashboard (keep it off on a public demo) |
 
 ## Project structure
 
@@ -238,6 +281,11 @@ app/
   prompts.py     System prompts for triage, investigation, revision and log filtering
   actions.py     Action catalog, validation, rehearsal (dry run) and execution
   simulator.py   Simulated data center: telemetry, logs, coolant loops, tools, failure drills
+  dcgm.py        Reads real DCGM telemetry from dcgm-exporter or Prometheus
+  kube.py        Kubernetes: nodes, GPU workloads, events; cordon, evict, nvidia-smi helper pods (with dry runs)
+  fleet.py       Polls real servers (DCGM + Kubernetes) in the background
+  fleet_sync.py  Real servers inside the data center model: hall R, their logs, jobs, tools, actions, rehearsals
+  dcgm_bridge.py This computer's GPU served in DCGM's format, to try the real-server path for free
   local_gpu.py   Reads this computer's real NVIDIA GPU through nvidia-smi and the Windows event log
   pc_actions.py  Fixes on this computer (Windows): light and serious mode, permission prompts, restore points
   modes.py       Light and serious mode, with serious mode switching itself off after 30 minutes
@@ -251,6 +299,8 @@ app/
   mock_llm.py    Offline stand-in for the models (demo mode and tests)
   benchmark.py   Runs failure drills on fresh data centers and scores the results
   cli.py         `models`, `analyze` and `benchmark` commands
+deploy/k8s/      Kubernetes permissions, a DCGM metrics list, demo training and buggy jobs
+deploy/nebius/   Set up a real GPU cluster on one Nebius AI Cloud VM, and cause failures on it
 static/          Dashboard (plain HTML, CSS and JavaScript; no build step)
 samples/         Example log for the analyzer
 tests/           Pytest suite
@@ -265,9 +315,12 @@ python -m pytest
 
 The suite runs every failure drill end to end in demo mode. It checks that a failed rehearsal makes the model revise its plan, and that a waiting plan is re-checked when a job crashes. It also checks that rehearsals never touch the real data center, that unsafe actions are blocked, and that the scan stays small as the fleet grows. It covers Ask your data center and the benchmark (including that a blind triage model scores zero), and smoke-tests the API too.
 
+The real-server tests use a stand-in dcgm-exporter (a real HTTP server speaking DCGM's format) and a stand-in for Kubernetes. They check that an Xid 79 is found, rehearsed with dry runs only, and fixed by cordoning and evicting after approval. They check that memory errors reset the GPU only after its job has moved, that a plan is revised to a ticket when Kubernetes isn't connected, and that a crashing workload goes to its owners. They also check that unsafe steps are refused. `tests/test_kube_live.py` runs the real Kubernetes adapter against a live API server when `NIGHTINGALE_TEST_KUBECONFIG` is set.
+
 ## Limitations and next steps
 
-- The data center is simulated; only this computer's GPU is real. Next: a real fleet through a DCGM exporter and Prometheus, or a rented GPU on Nebius AI Cloud.
+- Real servers are read through DCGM and Kubernetes. Slurm, BMC power control and a real ticketing system (Jira, ServiceNow) aren't connected yet: tickets and owner messages are recorded in Nightingale.
+- The big multi-hall data center is a simulator, because nobody can rent 4,096 GPUs for a demo. The real-server path is the same code and is tested on a real Kubernetes API.
 - Demo mode uses hand-written rules, not a model. Use a Token Factory key for the real experience.
 - Costs in the routing panel are estimates based on the per-token prices in your settings.
 - Planned: failure predictions for the next 24 hours, and written postmortems.

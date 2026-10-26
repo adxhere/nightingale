@@ -24,6 +24,9 @@ from .llm import LLMClient
 from . import actions as actions_mod
 from . import autostart
 from .alerts import Alerts
+from . import dcgm
+from .fleet import RealFleet
+from .kube import Kube
 from .local_gpu import LocalGPU
 from .modes import Modes
 from .pc_actions import PC_CATALOG, make_default
@@ -116,6 +119,41 @@ async def connect_local() -> tuple[bool, str]:
     return True, msg
 
 
+async def connect_fleet(url: str, kube_mode: str = "auto") -> tuple[bool, str]:
+    """Read real GPU servers through DCGM (and Kubernetes, so approved plans can act on them)."""
+    kube, note = None, ""
+    if kube_mode != "off":
+        kube, note = await asyncio.to_thread(
+            Kube.connect, settings.fleet_kubeconfig or None, settings.fleet_context or None,
+            namespace=settings.fleet_namespace, image=settings.fleet_tools_image,
+            runtime_class=settings.fleet_runtime_class)
+        if kube is None and kube_mode == "on":
+            return False, note
+    try:
+        reader = dcgm.make_reader(url, kube)
+    except ValueError as exc:
+        return False, str(exc)
+    fleet = RealFleet(reader, kube, settings.fleet_poll_seconds, settings.fleet_rack_label,
+                      kube_note="" if kube is not None else (note or "Kubernetes is turned off."))
+    await asyncio.to_thread(fleet.poll)
+    st = fleet.status()
+    if st["state"] != "ok":
+        return False, f"Couldn't read DCGM from {reader.describe()}: {st['error']}"
+    if cluster.fleet is not None:
+        disconnect_fleet()
+    cluster.attach_fleet(fleet)
+    fleet.start()
+    return True, (f"Connected to {st['servers']} real server{'s' if st['servers'] != 1 else ''} "
+                  f"({st['gpus']} GPU{'s' if st['gpus'] != 1 else ''}) through {reader.describe()}. "
+                  + (f"Kubernetes: {note}." if kube is not None else f"Watching only: {note or 'Kubernetes is off.'}"))
+
+
+def disconnect_fleet() -> None:
+    if cluster.fleet is not None:
+        cluster.detach_fleet()
+        agent.targets_gone("Closed: the real servers were disconnected from Nightingale.")
+
+
 def disconnect_local() -> None:
     if cluster.local is not None:
         cluster.local.stop()
@@ -130,12 +168,17 @@ async def lifespan(_app: FastAPI):
     if settings.local_gpu:
         ok, msg = await connect_local()
         log.info("This computer's GPU: %s", msg)
+    if settings.fleet_dcgm:
+        ok, msg = await connect_fleet(settings.fleet_dcgm, settings.fleet_kube)
+        log.info("Real GPU servers: %s", msg)
     task = asyncio.create_task(monitor_loop())
     yield
     task.cancel()
     store.save_incidents(agent.incidents)
     if cluster.local is not None:
         cluster.local.stop()
+    if cluster.fleet is not None:
+        cluster.fleet.stop()
 
 
 app = FastAPI(title="Nightingale", lifespan=lifespan)
@@ -155,6 +198,12 @@ class ResetBody(BaseModel):
 
 
 class LocalBody(BaseModel):
+    enabled: bool = True
+
+
+class FleetBody(BaseModel):
+    url: str = Field(default="", max_length=2000)
+    kube: str = "auto"
     enabled: bool = True
 
 
@@ -216,6 +265,7 @@ def state():
         "models": llm.models,
         "model_note": llm.model_note,
         "pc_mode": modes.status(),
+        "fleet_ui_connect": settings.fleet_ui_connect,
         "agent": {"windows": agent.windows, "quiet_windows": agent.quiet_windows, "last_triage": agent.last_triage,
                   "watching": sorted(agent.watch), "errors": list(agent.errors),
                   "tick_seconds": settings.tick_seconds,
@@ -325,6 +375,29 @@ async def local(body: LocalBody):
             raise HTTPException(400, msg)
     st = cluster.local_status() or {}
     return {"ok": True, "connected": True, "message": f"Connected to {st.get('name') or 'this GPU'}.", **st}
+
+
+@app.get("/api/fleet")
+def fleet_state():
+    st = cluster.fleet_status()
+    return {"connected": st is not None, "configured": settings.fleet_dcgm, "ui_connect": settings.fleet_ui_connect,
+            **(st or {})}
+
+
+@app.post("/api/fleet")
+async def fleet_connect(body: FleetBody):
+    """Connect (or disconnect) real GPU servers: a dcgm-exporter or Prometheus URL, or auto."""
+    if not body.enabled:
+        disconnect_fleet()
+        return {"ok": True, "connected": False}
+    if not settings.fleet_ui_connect:
+        raise HTTPException(403, "Connecting real servers from the dashboard is turned off here (FLEET_UI_CONNECT).")
+    if body.kube not in ("auto", "on", "off"):
+        raise HTTPException(400, "kube must be auto, on or off")
+    ok, msg = await connect_fleet(body.url.strip() or settings.fleet_dcgm, body.kube)
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "connected": True, "message": msg, **(cluster.fleet_status() or {})}
 
 
 @app.post("/api/reset")

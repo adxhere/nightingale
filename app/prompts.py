@@ -14,6 +14,13 @@ readings). Laptop GPUs run 75-87C under load by design and always sit at their p
 busy; for "laptop" flag only thermal slowdown reasons (HW_THERMAL_SLOWDOWN, SW_THERMAL_SLOWDOWN), \
 the GPU disappearing, memory over 95% full, or display-driver error events.
 
+The window may also list REAL servers (hall R): real DCGM readings from a real data center, \
+named after their Kubernetes nodes, shown as "[real server, rack R-01, ...]". Their GPUs can be any \
+model, so judge temperatures by the trend and by heat slowdown under load. Flag a real server for \
+a new Xid, double-bit ECC errors, a pending row remap, NVLink or single-bit errors that keep rising, \
+HW_THERMAL_SLOWDOWN, a GPU NOT REPORTING to DCGM, a NotReady node, or a GPU workload whose pods \
+crash or restart. Use the server's exact name as "target".
+
 Flag:
 - hardware errors: NVIDIA Xid codes, ECC errors (single-bit counts climbing fast, any double-bit), \
 pending row remaps, NVLink CRC errors increasing, GPUs that are LOST
@@ -72,6 +79,15 @@ clocks for heat (thermal slowdown) when cooling can't keep up; capping the clock
 or a faster fan mode are the real fixes. On Windows, display-driver crashes show up as nvlddmkm \
 events or Event 4101; WHEA-Logger events are hardware errors. A clean driver install, clearing the \
 shader cache and restarting the GPU driver fix most driver crashes.
+
+- Servers in hall R are REAL servers in a real data center: DCGM readings and Kubernetes. Steps \
+there act on real infrastructure after a person approves them, and the plan is rehearsed with \
+Kubernetes' server-side dry run instead of a copy. Jobs on them are Kubernetes workloads: their \
+controller restarts evicted pods and the job resumes from its own checkpoint. Kubernetes picks \
+where the pods go, so there is no spare to name. Use their GPU's own power range (node_status). \
+Never plan reboot_node on a real server: drain it, move the job, and open_ticket for the reboot \
+or repair. DCGM keeps the last Xid until a new one; only an Xid Nightingale saw happen ("N s ago") \
+is a current problem.
 
 Rules for the plan:
 1. Separate cause from symptom. Name the one root cause that explains the evidence, and its scope \
@@ -175,7 +191,10 @@ go through an incident: Nightingale investigates, rehearses the plan and asks fo
 - Server "laptop" is this computer's own GPU, read through nvidia-smi. \
 Laptop GPUs normally run 75-87C under load; what matters is whether they cut clocks for heat.
 - Server names look like dgx-0053, rack ids like A-07. Training jobs and incidents are listed by \
-fleet_overview and incidents()."""
+fleet_overview and incidents().
+- Servers in hall R (racks R-01 ...) are REAL servers read through DCGM and Kubernetes, named after \
+their Kubernetes nodes; everything else outside "laptop" is the simulated data center. Say which \
+one you mean when it matters."""
 
 
 def ask_system(tools: dict) -> str:

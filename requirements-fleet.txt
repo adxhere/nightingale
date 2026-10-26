@@ -1,0 +1,1 @@
+kubernetes>=29  # real GPU servers: Kubernetes nodes, GPU workloads and approved actions (app/kube.py)

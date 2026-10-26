@@ -239,15 +239,17 @@ class Agent:
     def _brief(self, inc: dict) -> str:
         c = self.cluster
         ev = " | ".join(inc["trigger"]["evidence"]) or "none"
-        jobs = "; ".join(f"{j.id}: {j.status}, {len(j.nodes)} servers ({len(j.nodes) * 8:,} GPUs), "
-                         f"speed {round(j.rate * 100)}%" for j in c.jobs.values())
+        jobs = "; ".join((f"{j.id}: {j.status}, real Kubernetes workload, {j.gpus} GPU(s) on {', '.join(j.nodes) or 'no node'}"
+                          if j.real else f"{j.id}: {j.status}, {len(j.nodes)} servers ({len(j.nodes) * 8:,} GPUs), "
+                          f"speed {round(j.rate * 100)}%") for j in c.jobs.values())
         others = ", ".join(f"{i['target']} ({i['title'] or i['trigger']['signal']})" for i in self.incidents
                            if i["id"] != inc["id"] and i["status"] in DEDUPE) or "none"
         return (f"Triage flagged: {inc['trigger']['signal']}\n"
                 f"Target: {inc['target']}" + (f", GPU {inc['gpu']}" if inc["gpu"] is not None else "") + "\n"
                 f"Evidence from triage: {ev}\n"
                 f"{c.target_summary(inc['target'])}\n"
-                f"Data center: {c.size:,} GPUs in {len(c.nodes)} servers and {len(c.racks)} racks.\n"
+                f"Data center: {c.size:,} simulated GPUs in {len(c.sim_nodes())} servers and {c.sim_rack_count()} racks"
+                + (f", plus {len(c.real_nodes())} real servers in hall R" if c.fleet is not None else "") + ".\n"
                 f"Jobs: {jobs}\n"
                 f"Known issues already handled: {c.known_issues() or 'none'}\n"
                 f"Other open incidents: {others}\n"
@@ -645,6 +647,15 @@ class Agent:
                 inc["status"] = "resolved"
                 inc["verification"] = "Closed: this computer's GPU was disconnected from Nightingale."
                 self._timeline(inc, inc["verification"])
+
+    def targets_gone(self, why: str) -> None:
+        """Open incidents on servers that are no longer connected (real servers disconnected)."""
+        for inc in self.incidents:
+            gone = inc["target"] not in self.cluster.nodes and inc["target"] not in self.cluster.racks
+            if gone and inc["status"] in OPEN:
+                inc["status"] = "resolved"
+                inc["verification"] = why
+                self._timeline(inc, why)
 
     def ticket_repaired(self, ticket: dict) -> None:
         target = ticket["node"] or ticket["rack"]

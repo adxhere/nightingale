@@ -624,3 +624,22 @@ details.plain > summary { font-size: 14px; color: var(--faint); min-height: 30px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Real GPU servers (hall R): marked "Real" wherever they appear */
+.tag-real { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  letter-spacing: .02em; color: var(--accent); border: 1px solid var(--accent-line); vertical-align: 1px; line-height: 17px; }
+.rack.real { border-color: var(--accent-line); }
+.rack.real .cells { flex: 1; }
+.rack.real { grid-template-rows: auto 1fr auto; }
+.rack.real .cells.n1, .rack.real .cells.n2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.rack.real .cells.n1 span, .rack.real .cells.n2 span { aspect-ratio: auto; min-height: 24px; border-radius: 4px; }
+.rack.real .cells.n3, .rack.real .cells.n4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.racks.mini .rack.real .cells span { min-height: 10px; }
+.fleet-form { display: grid; gap: 8px; }
+.fleet-form label { font-size: 13px; font-weight: 600; }
+.fleet-form input, .fleet-form select { width: 100%; min-height: 40px; }
+.fleet-form select { background: var(--raised); border: 1px solid var(--control); border-radius: var(--r-btn); padding: 0 10px; font-size: 14px; }
+.fleet-form select:focus { outline: none; border-color: var(--accent-line); }
+.fleet-form p { margin: 0; }
+.racks:not(.mini) .rack.real { grid-column: span 2; }
+.rack.real .rack-head b { white-space: nowrap; }

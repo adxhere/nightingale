@@ -57,6 +57,23 @@ class Settings:
         # A simulated laptop (readings and Windows) for the public demo and for machines without one.
         self.demo_pc = _bool("DEMO_PC", False)
 
+        # Real GPU servers. FLEET_DCGM is where their DCGM readings come from: "auto" (every dcgm-exporter
+        # pod in the Kubernetes cluster), a Prometheus URL (http://prometheus:9090), or dcgm-exporter
+        # /metrics URLs (comma separated). Empty: no real servers (connect them from Data sources instead).
+        self.fleet_dcgm = os.getenv("FLEET_DCGM", "").strip()
+        # Kubernetes lets approved plans act on those servers: auto (use it if a kubeconfig or in-cluster
+        # service account works), on (required), off (watch only).
+        self.fleet_kube = os.getenv("FLEET_KUBE", "auto").strip().lower()
+        self.fleet_kubeconfig = os.getenv("FLEET_KUBECONFIG", "").strip()  # else KUBECONFIG, ~/.kube/config or in-cluster
+        self.fleet_context = os.getenv("FLEET_KUBE_CONTEXT", "").strip()
+        self.fleet_namespace = os.getenv("FLEET_NAMESPACE", "nightingale")      # for the nvidia-smi helper pods
+        self.fleet_tools_image = os.getenv("FLEET_TOOLS_IMAGE", "nvcr.io/nvidia/cuda:12.6.3-base-ubuntu22.04")
+        self.fleet_runtime_class = os.getenv("FLEET_RUNTIME_CLASS", "nvidia")  # empty: cluster default runtime
+        self.fleet_poll_seconds = _float("FLEET_POLL_SECONDS", 5.0)
+        self.fleet_rack_label = os.getenv("FLEET_RACK_LABEL", "nightingale.io/rack")
+        # The dashboard may connect real servers by URL (off for a public demo: the server would fetch any URL).
+        self.fleet_ui_connect = _bool("FLEET_UI_CONNECT", not self.demo_pc)
+
         # Safety: low-risk steps (power cap, ticket, notify) may run without a click if enabled.
         self.auto_approve_low_risk = _bool("AUTO_APPROVE_LOW_RISK", False)
 

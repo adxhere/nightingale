@@ -1,0 +1,71 @@
+# What Nightingale may do in a Kubernetes cluster, and nothing more. Apply this when Nightingale runs
+# inside the cluster (its pod uses the "nightingale" service account); outside, give its kubeconfig
+# the same permissions.
+#
+# Reads: nodes, pods and events everywhere (to see GPU servers, GPU workloads and what went wrong).
+# Acts, only on an approved step: cordon/uncordon nodes, evict pods (respects PodDisruptionBudgets),
+# and run short-lived nvidia-smi helper pods in its own namespace. Every one of these is first
+# rehearsed with Kubernetes' server-side dry run, which needs the same permissions.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nightingale
+  labels:
+    app.kubernetes.io/managed-by: nightingale
+    # the nvidia-smi helper pods are privileged (setting a power limit or resetting a GPU needs it)
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nightingale
+  namespace: nightingale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nightingale
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]          # patch = cordon / uncordon only
+  - apiGroups: [""]
+    resources: ["pods", "events", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]                                  # move a job: evict its pods
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nightingale
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: nightingale}
+subjects:
+  - {kind: ServiceAccount, name: nightingale, namespace: nightingale}
+---
+# The nvidia-smi helper pods live only in Nightingale's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nightingale-helpers
+  namespace: nightingale
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nightingale-helpers
+  namespace: nightingale
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: nightingale-helpers}
+subjects:
+  - {kind: ServiceAccount, name: nightingale, namespace: nightingale}

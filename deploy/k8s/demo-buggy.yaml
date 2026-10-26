@@ -1,0 +1,37 @@
+# A GPU job with a real bug: it reads far outside the memory it owns. The GPU raises a genuine
+# "illegal memory access" and the NVIDIA driver reports an Xid (usually 31, a memory page fault),
+# which DCGM passes on. The hardware is fine: the right answer is to tell the job's owners.
+apiVersion: v1
+kind: Namespace
+metadata: {name: research}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: embeddings-bug
+  namespace: research
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels: {app: embeddings-bug}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: train
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import time, torch
+              print("embeddings: mining hard negatives", flush=True)
+              time.sleep(20)
+              table = torch.zeros(1024, device="cuda")
+              # the bug: a stride that points far past the end of the table
+              bad = torch.as_strided(table, (1024,), (1 << 40,))
+              print(bad.sum().item(), flush=True)
+          resources:
+            limits: {nvidia.com/gpu: 1}
